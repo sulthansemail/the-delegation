@@ -6,6 +6,7 @@ import { useTeamStore } from '../../integration/store/teamStore';
 import { ToolRegistry } from './ToolRegistry';
 import { PromptBuilder } from './PromptBuilder';
 import { AGENTIC_SETS, AgentNode } from '../../data/agents';
+import { GroundingCitation } from './researchTypes';
 
 export interface BrainHost {
   data: AgentNode;
@@ -41,11 +42,17 @@ export class AgentBrain {
       if (!llmConfig.apiKey) throw new Error('Gemini API key is required');
       const provider = new GeminiProvider(llmConfig.apiKey);
       const model = this.host.data.model || llmConfig.model;
+      const currentTaskId = this.host.getCurrentTaskId() || undefined;
       const teamId = useTeamStore.getState().selectedAgentSetId;
       const activeTeam = useTeamStore.getState().customSystems.find(s => s.id === teamId)
         || AGENTIC_SETS.find(s => s.id === teamId);
+      const isLead = this.host.data.index === 1;
 
       const hasVisionSupport = activeTeam?.outputType === 'image' || activeTeam?.outputType === 'video';
+
+      if (options.isChat && !options.silent && isLead && core.phase === 'idle') {
+        this.logActivity('received_brief', `${this.host.data.name} received user brief.`);
+      }
 
       // 1. Manage Message History
       if (!options.isChat) {
@@ -80,6 +87,12 @@ export class AgentBrain {
       const systemPrompt = PromptBuilder.buildSystemPrompt(this.host.data, core.phase, core.userBrief, allAgents);
       const toolDefs = options.tools || ToolRegistry.getDefinitions(this.host.data.index, core.phase, this.host.data.subagents?.length || 0);
 
+      if (options.isChat && !options.silent && isLead && core.phase === 'idle') {
+        this.logActivity('reviewing_brief', `${this.host.data.name} reviewing brief.`);
+      } else if (!isLead && currentTaskId) {
+        this.logActivity('researching', `${this.host.data.name} researching assigned task.`, currentTaskId);
+      }
+
       // 3. Log and Execute LLM Call
       core.addRequestLog({
         agentIndex: this.host.data.index,
@@ -87,7 +100,7 @@ export class AgentBrain {
         systemInstruction: systemPrompt,
         contents: messages,
         systemTools: toolDefs,
-        taskId: this.host.getCurrentTaskId() || undefined
+        taskId: currentTaskId
       });
 
       const response = await provider.generateCompletion(
@@ -104,15 +117,33 @@ export class AgentBrain {
         content: response.content || '',
         tool_calls: response.tool_calls,
         usage: response.usage,
-        raw: response.raw,
-        taskId: this.host.getCurrentTaskId() || undefined
+        raw: {
+          providerRequest: response.request,
+          providerResponse: response.raw,
+          grounding: response.grounding
+        },
+        taskId: currentTaskId
       });
 
       // 5. Parse Tool Calls
       const text = response.content || '';
+      const groundingCitations: GroundingCitation[] | undefined = response.grounding?.citations?.length
+        ? response.grounding.citations.map(citation => ({
+            url: citation.url,
+            title: citation.title,
+            citedText: citation.citedText,
+            startIndex: citation.startIndex,
+            endIndex: citation.endIndex
+          }))
+        : undefined;
+
       const toolCalls = response.tool_calls?.map(tc => {
         try {
-          return { name: tc.function.name, args: JSON.parse(tc.function.arguments) };
+          const parsedArgs = JSON.parse(tc.function.arguments);
+          if (groundingCitations?.length) {
+            parsedArgs.groundingCitations = groundingCitations;
+          }
+          return { name: tc.function.name, args: parsedArgs };
         } catch (e) {
           console.error('[AgentBrain] Failed to parse tool arguments', tc.function.arguments);
           return null;
@@ -158,6 +189,7 @@ export class AgentBrain {
       // 7. Process Actions (Tools)
       for (const tc of toolCalls) {
         const handled = ToolRegistry.process(this.host as any, tc);
+        this.logToolActivity(tc, allAgents, handled);
         if (tc.name === 'deliver_project' && handled) {
           this.handleFinalAssetGeneration(tc.args.output);
         }
@@ -167,6 +199,7 @@ export class AgentBrain {
     } catch (error) {
       console.error(`[AgentBrain:${this.host.data.name}] Logic error:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
+      this.logActivity('failed', `${this.host.data.name} task failed.`, this.host.getCurrentTaskId() || undefined);
       useUiStore.getState().setBYOKOpen(true, errMsg);
       throw error;
     } finally {
@@ -177,16 +210,22 @@ export class AgentBrain {
 
   /** Autonomous Intent: Start the project strategy. */
   public async spark() {
+    this.logActivity('planning', `${this.host.data.name} planning delegation.`);
     return this.think('Start the project by proposing initial tasks.', { silent: true });
   }
 
   /** Autonomous Intent: Work on a specific task. */
   public async executeTask(taskId: string) {
+    const task = useCoreStore.getState().tasks.find(t => t.id === taskId);
+    const taskTitle = task?.title ? `: ${task.title}` : '';
+    this.logActivity('started_task', `${this.host.data.name} started task${taskTitle}.`, taskId);
     return this.think(`Proceed with task: ${taskId}`, { silent: true });
   }
 
   /** Autonomous Intent: Finalize and deliver the project results. */
   public async concludeProject() {
+    this.logActivity('reviewing_result', `${this.host.data.name} reviewing delegated results.`);
+    this.logActivity('synthesizing', `${this.host.data.name} synthesizing final answer.`);
     return this.think('All tasks are complete! Use the deliver_project tool to fulfill the final delivery with the project result.', { silent: true });
   }
 
@@ -268,7 +307,7 @@ export class AgentBrain {
         usage = result.usage;
       } else if (activeTeam.outputType === 'text') {
         // For text, the prompt is the final output
-        core.setFinalOutput(prompt);
+        core.setFinalOutput(prompt, core.finalOutputArtifacts);
         core.setPhase('done');
         core.setFinalOutputOpen(true);
         core.setIsGeneratingAsset(false);
@@ -284,7 +323,7 @@ export class AgentBrain {
         taskId: undefined
       });
 
-      core.setFinalOutput(prompt);
+      core.setFinalOutput(prompt, core.finalOutputArtifacts);
       core.setFinalAsset(activeTeam.outputType === 'music' ? 'audio' : activeTeam.outputType as any, assetContent);
       core.setPhase('done');
       core.setFinalOutputOpen(true);
@@ -314,5 +353,40 @@ export class AgentBrain {
 
   private syncToStore() {
     useCoreStore.getState().setAgentHistory(this.host.data.index, this.history);
+  }
+
+  private logActivity(event: 'received_brief' | 'reviewing_brief' | 'planning' | 'delegating' | 'started_task' | 'researching' | 'completed_task' | 'reviewing_result' | 'synthesizing' | 'failed' | 'system', message: string, taskId?: string) {
+    useCoreStore.getState().addActivityEvent({
+      agentIndex: this.host.data.index,
+      agentName: this.host.data.name,
+      event,
+      message,
+      taskId,
+    });
+  }
+
+  private logToolActivity(toolCall: { name: string; args: any }, allAgents: any[], handled: boolean) {
+    if (!handled) return;
+
+    if (toolCall.name === 'set_user_brief') {
+      this.logActivity('received_brief', `${this.host.data.name} received user brief.`);
+      return;
+    }
+
+    if (toolCall.name === 'propose_task') {
+      const agent = allAgents.find((candidate: any) => candidate.data.index === toolCall.args.agentId);
+      const targetName = agent?.data?.name || `Agent ${toolCall.args.agentId}`;
+      this.logActivity('delegating', `${this.host.data.name} delegating task to ${targetName}.`);
+      return;
+    }
+
+    if (toolCall.name === 'complete_task') {
+      this.logActivity('completed_task', `${this.host.data.name} completed task.`, toolCall.args.taskId);
+      return;
+    }
+
+    if (toolCall.name === 'deliver_project') {
+      this.logActivity('synthesizing', `${this.host.data.name} finalized delegated output.`);
+    }
   }
 }

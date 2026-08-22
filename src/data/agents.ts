@@ -38,6 +38,65 @@ export interface AgenticSystem {
 
 export const AGENTIC_SETS: AgenticSystem[] = [
   {
+    id: 'islamic-investment-research',
+    teamName: 'Islamic Investment Research',
+    teamType: 'Equity Research',
+    teamDescription: 'A delegation workflow for source-backed Indian Islamic-investment research with strict business and financial screening.',
+    color: '#0F766E',
+    outputType: 'text',
+    outputModel: DEFAULT_MODELS.text,
+    outputAutoApprove: true,
+    user: { index: 0, model: 'Human', position: { x: 0, y: 0 } },
+    leadAgent: {
+      id: 'research-lead-agent',
+      index: 1,
+      name: 'Lead Agent',
+      description: 'Orchestrates specialist Islamic-investment research, delegates evidence gathering, and synthesizes only source-backed conclusions.',
+      color: '#0F766E',
+      model: DEFAULT_MODELS.text,
+      humanInTheLoop: true,
+      position: { x: 0, y: 130 },
+      subagents: [
+        {
+          id: 'islamic-screening-agent',
+          index: 2,
+          name: 'Islamic Screening Agent',
+          description: 'Screens Indian listed companies using strict business and financial evidence from filings, annual reports, notes, and recent disclosures.',
+          color: '#14B8A6',
+          model: DEFAULT_MODELS.text,
+          position: { x: -360, y: 280 }
+        },
+        {
+          id: 'fundamental-research-agent',
+          index: 3,
+          name: 'Fundamental Research Agent',
+          description: 'Builds a source-backed view on growth, profitability, capital allocation, management quality, valuation, and competitive position.',
+          color: '#84CC16',
+          model: DEFAULT_MODELS.text,
+          position: { x: -120, y: 280 }
+        },
+        {
+          id: 'risk-portfolio-agent',
+          index: 4,
+          name: 'Risk and Portfolio Agent',
+          description: 'Challenges bullish assumptions, weighs risk and conviction, and keeps recommendations aligned with the screening result.',
+          color: '#F59E0B',
+          model: DEFAULT_MODELS.text,
+          position: { x: 120, y: 280 }
+        },
+        {
+          id: 'kronos-market-forecast-agent',
+          index: 5,
+          name: 'Kronos Market Forecast Agent',
+          description: 'Reports Kronos output only when a real Kronos result exists; otherwise clearly marks Kronos as unavailable.',
+          color: '#6366F1',
+          model: DEFAULT_MODELS.text,
+          position: { x: 360, y: 280 }
+        }
+      ]
+    }
+  },
+  {
     id: 'unboring-net',
     teamName: 'unboring.net',
     teamType: 'Agency',

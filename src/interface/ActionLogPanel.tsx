@@ -2,7 +2,7 @@ import { Check, ChevronDown, ChevronRight, Copy, Download, Eye, Filter, MessageS
 import React, { useEffect, useRef, useState } from 'react'
 import { getAgentSet, getAllAgents } from '../data/agents'
 import { USER_COLOR, USER_COLOR_LIGHT } from '../theme/brand'
-import { DebugLogEntry, useCoreStore } from '../integration/store/coreStore'
+import { ActivityLogEvent, DebugLogEntry, useCoreStore } from '../integration/store/coreStore'
 import { useTeamStore, useActiveTeam } from '../integration/store/teamStore'
 import { formatTokens } from './ProjectView'
 
@@ -325,12 +325,28 @@ ${JSON.stringify(entry.raw, null, 2)}
 };
 
 export function ActionLogPanel() {
-    const { setLogOpen, actionLog, debugLog, logFilterAgentIndex } = useCoreStore()
+    const { setLogOpen, actionLog, activityLog, debugLog, logFilterAgentIndex } = useCoreStore()
     const activeTeam = useActiveTeam();
     const agents = getAllAgents(activeTeam);
     const [activeTab, setActiveTab] = useState<'activity' | 'technical'>('technical')
     const [isFilterMenuOpen, setIsFilterMenuOpen] = useState(false)
     const topRef = useRef<HTMLDivElement>(null)
+    const activityContainerRef = useRef<HTMLDivElement>(null)
+
+    const legacyActivityEntries: ActivityLogEvent[] = actionLog.map((entry) => {
+        const agent = agents.find(a => a.index === entry.agentIndex)
+        return {
+            id: `legacy_${entry.id}`,
+            timestamp: entry.timestamp,
+            agentIndex: entry.agentIndex,
+            agentName: agent?.name || 'System',
+            event: 'system',
+            message: entry.action,
+            taskId: entry.taskId,
+        }
+    })
+
+    const combinedActivityEntries = [...legacyActivityEntries, ...activityLog]
 
     const handleDownloadAll = () => {
         const content = debugLog.map(entry => {
@@ -380,13 +396,23 @@ ${JSON.stringify(entry.raw, null, 2)}
         setTimeout(() => topRef.current?.scrollIntoView({ behavior: 'smooth' }), 100)
     }, [actionLog, debugLog, activeTab])
 
+    useEffect(() => {
+        if (activeTab !== 'activity') return;
+
+        setTimeout(() => {
+            const container = activityContainerRef.current;
+            if (!container) return;
+            container.scrollTop = 0;
+        }, 50)
+    }, [activityLog, activeTab])
+
     const filterAgent =
         logFilterAgentIndex !== null ? agents.find(a => a.index === logFilterAgentIndex) ?? null : null
 
     const entries =
         logFilterAgentIndex !== null
-            ? actionLog.filter((e) => e.agentIndex === logFilterAgentIndex).reverse()
-            : [...actionLog].reverse()
+            ? combinedActivityEntries.filter((e) => e.agentIndex === logFilterAgentIndex).sort((a, b) => b.timestamp - a.timestamp)
+            : [...combinedActivityEntries].sort((a, b) => b.timestamp - a.timestamp)
 
     const debugEntries =
         logFilterAgentIndex !== null
@@ -500,7 +526,7 @@ ${JSON.stringify(entry.raw, null, 2)}
             </div>
 
             {/* Entries */}
-            <div className="flex-1 overflow-y-auto p-5 space-y-4 shadow-[inset_0_-20px_20px_-20px_rgba(0,0,0,0.05)]">
+            <div ref={activeTab === 'activity' ? activityContainerRef : undefined} className="flex-1 overflow-y-auto p-5 space-y-4 shadow-[inset_0_-20px_20px_-20px_rgba(0,0,0,0.05)]">
                 <div ref={topRef} />
 
                 {activeTab === 'activity' ? (
@@ -518,7 +544,10 @@ ${JSON.stringify(entry.raw, null, 2)}
                                                 style={{ backgroundColor: agent?.color ?? '#e4e4e7' }}
                                             />
                                             <span className="text-[10px] font-black text-darkDelegation uppercase tracking-widest leading-none">
-                                                {agent?.name ?? 'System'}
+                                                {entry.agentName || agent?.name || 'System'}
+                                            </span>
+                                            <span className="text-[8px] font-bold px-1.5 py-0.5 rounded uppercase tracking-tighter whitespace-nowrap bg-zinc-50 text-zinc-500 border border-zinc-100">
+                                                {entry.event.replace(/_/g, ' ')}
                                             </span>
                                         </div>
                                         <span className="text-[9px] font-medium text-zinc-400 font-mono">
@@ -528,7 +557,7 @@ ${JSON.stringify(entry.raw, null, 2)}
 
                                     <div className="pl-3.5 border-l border-zinc-50 group-hover:border-zinc-200 transition-colors">
                                         <p className="text-xs text-zinc-600 leading-relaxed font-medium">
-                                            {entry.action}
+                                            {entry.message}
                                         </p>
                                     </div>
                                 </div>

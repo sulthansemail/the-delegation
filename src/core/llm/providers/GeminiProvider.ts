@@ -1,8 +1,9 @@
 import { FunctionDeclaration, GoogleGenAI, Tool, Type } from '@google/genai';
-import { LLMMessage, LLMProvider, LLMResponse, LLMToolCall, LLMToolDefinition } from '../types';
+import { LLMGroundingCitation, LLMMessage, LLMProvider, LLMResponse, LLMToolCall, LLMToolDefinition } from '../types';
 import { DEFAULT_MODELS } from '../constants';
 import { calculateTokensForCost } from '../pricing';
 
+export const ENABLE_GOOGLE_SEARCH_GROUNDING = true;
 
 export class GeminiProvider implements LLMProvider {
   private client: GoogleGenAI;
@@ -19,29 +20,37 @@ export class GeminiProvider implements LLMProvider {
   ): Promise<LLMResponse> {
     const contents = this.mapMessagesToGemini(messages);
 
-    const systemTools: Tool[] | undefined = tools ? [{
-      functionDeclarations: tools.map(t => ({
-        name: t.function.name,
-        description: t.function.description,
-        parameters: this.mapToGeminiSchema(t.function.parameters)
-      } as FunctionDeclaration))
-    }] : undefined;
+    const functionDeclarations = tools?.map(t => ({
+      name: t.function.name,
+      description: t.function.description,
+      parameters: this.mapToGeminiSchema(t.function.parameters)
+    } as FunctionDeclaration));
 
-    console.log("sent to Gemini")
-    console.log("contents--------", contents);
-    console.log("systemInstruction--------", systemInstruction);
-    console.log("tools--------", tools);
+    const systemTools: Tool[] = [];
+    if (functionDeclarations && functionDeclarations.length > 0) {
+      systemTools.push({ functionDeclarations });
+    }
+
+    const grounding = this.getGroundingRequest(modelName, Boolean(functionDeclarations?.length));
+
+    if (grounding.status === 'unsupported-combination') {
+      throw new Error(grounding.reason || `Model ${modelName} cannot combine Google Search grounding with function calling in this workflow.`);
+    }
+
+    if (grounding.enabled) {
+      systemTools.push({ googleSearch: {} });
+    }
+
     const result = await this.client.models.generateContent({
       model: modelName,
       contents,
       config: {
         systemInstruction: systemInstruction,
-        tools: systemTools,
+        tools: systemTools.length > 0 ? systemTools : undefined,
       }
     });
-    console.log("received from Gemini")
-    console.log("result--------", result);
     const candidate = result.candidates?.[0];
+    const groundingMetadata = candidate?.groundingMetadata;
     const parts = candidate?.content?.parts || [];
 
     let contentStr: string | null = null;
@@ -88,18 +97,116 @@ export class GeminiProvider implements LLMProvider {
       totalTokens: result.usageMetadata.totalTokenCount || 0
     } : undefined;
 
+    const citations = this.extractGroundingCitations(parts);
+
     return {
       content: contentStr,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,
       finishReason: candidate?.finishReason as string,
-      raw: result, // Return the original SDK result for technical logging
+      grounding: {
+        enabled: grounding.enabled,
+        citations,
+        searchQueries: this.extractSearchQueries(groundingMetadata)
+      },
+      raw: {
+        ...result,
+        groundingMetadata
+      }, // Return the original SDK result for technical logging
       request: {
         contents,
         systemInstruction,
-        tools: systemTools
+        tools: systemTools.length > 0 ? systemTools : undefined,
+        grounding: {
+          enabled: grounding.enabled,
+          status: grounding.status,
+          reason: grounding.reason,
+          tool: grounding.enabled ? 'googleSearch' : undefined
+        }
       }
     };
+  }
+
+  private getGroundingRequest(modelName: string, hasFunctionDeclarations: boolean): {
+    enabled: boolean;
+    status: 'enabled' | 'disabled' | 'unsupported-model' | 'unsupported-combination';
+    reason?: string;
+  } {
+    if (!ENABLE_GOOGLE_SEARCH_GROUNDING) {
+      return { enabled: false, status: 'disabled', reason: 'Google Search grounding is disabled by configuration.' };
+    }
+
+    if (!this.shouldEnableGoogleSearchForText(modelName)) {
+      return { enabled: false, status: 'unsupported-model', reason: `Model ${modelName} is not a text model for Google Search grounding.` };
+    }
+
+    if (hasFunctionDeclarations && !this.supportsGroundedFunctionCalling(modelName)) {
+      return {
+        enabled: false,
+        status: 'unsupported-combination',
+        reason: `Model ${modelName} does not safely support combining Google Search grounding with function calling in this app. Select a Gemini 3 text model.`
+      };
+    }
+
+    return { enabled: true, status: 'enabled' };
+  }
+
+  private shouldEnableGoogleSearchForText(modelName: string): boolean {
+    const model = modelName.toLowerCase();
+    return !model.includes('image') && !model.includes('audio') && !model.includes('video');
+  }
+
+  private supportsGroundedFunctionCalling(modelName: string): boolean {
+    const model = modelName.toLowerCase();
+    return model.startsWith('gemini-3');
+  }
+
+  private extractGroundingCitations(parts: any[]): LLMGroundingCitation[] {
+    const citations: LLMGroundingCitation[] = [];
+
+    for (const part of parts) {
+      const text = part.text || '';
+      const annotations = part.annotations || [];
+
+      for (const annotation of annotations) {
+        const rawCitation = annotation.urlCitation || annotation;
+        const url = rawCitation?.url;
+        if (!url) continue;
+
+        const startIndex = rawCitation.startIndex ?? annotation.startIndex;
+        const endIndex = rawCitation.endIndex ?? annotation.endIndex;
+        const citedText = typeof startIndex === 'number' && typeof endIndex === 'number'
+          ? text.slice(startIndex, endIndex)
+          : undefined;
+
+        citations.push({
+          url,
+          title: rawCitation.title,
+          citedText,
+          startIndex,
+          endIndex
+        });
+      }
+    }
+
+    return citations;
+  }
+
+  private extractSearchQueries(groundingMetadata: any): string[] | undefined {
+    const directQueries = groundingMetadata?.webSearchQueries;
+    if (Array.isArray(directQueries) && directQueries.length > 0) {
+      return directQueries.filter((query: unknown): query is string => typeof query === 'string' && query.length > 0);
+    }
+
+    const chunks = groundingMetadata?.groundingChunks;
+    if (Array.isArray(chunks)) {
+      const queries = chunks
+        .map((chunk: any) => chunk?.web?.query || chunk?.query)
+        .filter((query: unknown): query is string => typeof query === 'string' && query.length > 0);
+      return queries.length > 0 ? Array.from(new Set(queries)) : undefined;
+    }
+
+    return undefined;
   }
 
   async generateImage(

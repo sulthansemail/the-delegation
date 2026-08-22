@@ -3,6 +3,7 @@ import { setUserBrief } from './tools/setUserBrief';
 import { proposeTask } from './tools/proposeTask';
 import { completeTask } from './tools/completeTask';
 import { deliverProject } from './tools/deliverProject';
+import { RESEARCH_EVIDENCE_ITEM_SCHEMA, RESEARCH_FINDING_ITEM_SCHEMA } from './researchTypes';
 
 export interface ToolCall {
   name: string;
@@ -92,12 +93,22 @@ export class ToolRegistry {
           type: 'function',
           function: {
             name: 'complete_task',
-            description: 'Finish task. Output must be raw content, no introductions or credit for the work.',
+            description: 'Finish task. Output must be raw content, no introductions or credit for the work. For research workflows, include source-preserving evidence and findings whenever available.',
             parameters: {
               type: 'object',
               properties: {
                 taskId: { type: 'string' },
-                output: { type: 'string', description: 'Task result in Markdown (e.g. code blocks, text, or research).' }
+                output: { type: 'string', description: 'Task result in Markdown (e.g. code blocks, text, or research).' },
+                evidence: {
+                  type: 'array',
+                  description: 'Optional structured evidence records for research outputs.',
+                  items: RESEARCH_EVIDENCE_ITEM_SCHEMA
+                },
+                findings: {
+                  type: 'array',
+                  description: 'Optional structured findings derived from the research.',
+                  items: RESEARCH_FINDING_ITEM_SCHEMA
+                }
               },
               required: ['taskId', 'output']
             }
@@ -110,14 +121,24 @@ export class ToolRegistry {
           type: 'function',
           function: {
             name: 'deliver_project',
-            description: 'Final delivery of the full project results.',
+            description: 'Final delivery of the full project results. For research workflows, include source-preserving evidence and findings whenever available.',
             parameters: {
               type: 'object',
               properties: { 
                 output: { 
                   type: 'string', 
                   description: 'Full project document in Markdown. NO attribution needed.' 
-                } 
+                },
+                evidence: {
+                  type: 'array',
+                  description: 'Optional structured evidence records for the final delivery.',
+                  items: RESEARCH_EVIDENCE_ITEM_SCHEMA
+                },
+                findings: {
+                  type: 'array',
+                  description: 'Optional structured findings for the final delivery.',
+                  items: RESEARCH_FINDING_ITEM_SCHEMA
+                }
               },
               required: ['output']
             }

@@ -2,10 +2,31 @@ import { AgentActionContext } from '../ToolRegistry';
 import { useCoreStore } from '../../../integration/store/coreStore';
 import { useTeamStore } from '../../../integration/store/teamStore';
 import { AGENTIC_SETS } from '../../../data/agents';
+import { GroundingCitation, ResearchArtifacts, ResearchEvidenceRecord, ResearchFindingRecord } from '../researchTypes';
 
-export function deliverProject(agent: AgentActionContext, args: { output: string }): boolean {
+function buildArtifacts(args: {
+  evidence?: ResearchEvidenceRecord[];
+  findings?: ResearchFindingRecord[];
+  groundingCitations?: GroundingCitation[];
+}): ResearchArtifacts | undefined {
+  const artifacts: ResearchArtifacts = {};
+
+  if (args.evidence?.length) artifacts.evidence = args.evidence;
+  if (args.findings?.length) artifacts.findings = args.findings;
+  if (args.groundingCitations?.length) artifacts.groundingCitations = args.groundingCitations;
+
+  return Object.keys(artifacts).length > 0 ? artifacts : undefined;
+}
+
+export function deliverProject(agent: AgentActionContext, args: {
+  output: string;
+  evidence?: ResearchEvidenceRecord[];
+  findings?: ResearchFindingRecord[];
+  groundingCitations?: GroundingCitation[];
+}): boolean {
   const store = useCoreStore.getState();
   const { output } = args;
+  const artifacts = buildArtifacts(args);
 
   // VALIDATION: Only Lead Agent (index 1) can deliver
   if (store.phase !== 'working') return false;
@@ -31,7 +52,7 @@ export function deliverProject(agent: AgentActionContext, args: { output: string
     store.setIsGeneratingAsset(true);
     // We don't set phase to 'done' yet, AgentHost will handle generation then set phase to done.
   } else {
-    store.setFinalOutput(output);
+    store.setFinalOutput(output, artifacts);
     store.setPhase('done');
   }
   

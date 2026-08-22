@@ -36,10 +36,30 @@ export interface LLMConfig {
   model: string;
 }
 
+export interface LLMGroundingCitation {
+  url: string;
+  title?: string;
+  citedText?: string;
+  startIndex?: number;
+  endIndex?: number;
+}
+
+export interface LLMGroundingDetails {
+  enabled: boolean;
+  citations: LLMGroundingCitation[];
+  searchQueries?: string[];
+}
+
 export interface LLMRequestDetails {
   contents: any[];
   systemInstruction?: string;
   tools?: any[];
+  grounding?: {
+    enabled: boolean;
+    status: 'enabled' | 'disabled' | 'unsupported-model' | 'unsupported-combination';
+    reason?: string;
+    tool?: 'googleSearch';
+  };
 }
 
 export interface LLMTokenUsage {
@@ -53,6 +73,7 @@ export interface LLMResponse {
   tool_calls?: LLMToolCall[];
   usage?: LLMTokenUsage;
   finishReason?: string;
+  grounding?: LLMGroundingDetails;
   raw?: any; // The original provider response
   request?: LLMRequestDetails;
 }

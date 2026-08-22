@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { LLMMessage, LLMTokenUsage, LLMToolCall, LLMToolDefinition } from '../../core/llm/types';
+import { ResearchArtifacts } from '../../core/agent/researchTypes';
 import { DEFAULT_MODELS, AVAILABLE_MODELS } from '../../core/llm/constants';
 import { calculateCost } from '../../core/llm/pricing';
 import { useTeamStore } from './teamStore';
@@ -11,6 +12,7 @@ export type TaskStatus = 'scheduled' | 'on_hold' | 'in_progress' | 'done'
 export interface TaskRevision {
   output: string
   feedback?: string
+  artifacts?: ResearchArtifacts
   timestamp: number
 }
 
@@ -23,8 +25,10 @@ export interface Task {
   parentTaskId?: string
   requiresUserApproval: boolean,
   draftOutput?: string,
+  draftArtifacts?: ResearchArtifacts,
   reviewComments?: string,
   output?: string,
+  artifacts?: ResearchArtifacts,
   revisions: TaskRevision[]
   createdAt: number
   updatedAt: number
@@ -35,6 +39,29 @@ export interface ActionLogEntry {
   timestamp: number
   agentIndex: number
   action: string
+  taskId?: string
+}
+
+export type ActivityEventStatus =
+  | 'received_brief'
+  | 'reviewing_brief'
+  | 'planning'
+  | 'delegating'
+  | 'started_task'
+  | 'researching'
+  | 'completed_task'
+  | 'reviewing_result'
+  | 'synthesizing'
+  | 'failed'
+  | 'system';
+
+export interface ActivityLogEvent {
+  id: string
+  timestamp: number
+  agentIndex: number
+  agentName: string
+  event: ActivityEventStatus
+  message: string
   taskId?: string
 }
 
@@ -72,6 +99,7 @@ interface CoreState {
   referenceImages: string[]
   phase: ProjectPhase
   finalOutput: string | null
+  finalOutputArtifacts: ResearchArtifacts | null
   availableModels: string[]
   totalTokenUsage: LLMTokenUsage
   agentTokenUsage: Record<number, LLMTokenUsage>
@@ -91,6 +119,7 @@ interface CoreState {
 
   // ── Log ──────────────────────────────────────────────────────
   actionLog: ActionLogEntry[]
+  activityLog: ActivityLogEvent[]
   debugLog: DebugLogEntry[]
 
   // ── Conversation histories (Agnostic standard) ───────────────
@@ -113,7 +142,7 @@ interface CoreState {
   clearReferenceImages: () => void;
   setPhase: (phase: ProjectPhase) => void;
   startProject: (brief: string) => void;
-  setFinalOutput: (output: string) => void;
+  setFinalOutput: (output: string, artifacts?: ResearchArtifacts | null) => void;
   setFinalAsset: (type: 'image' | 'audio' | 'video', content: string) => void;
   setIsGeneratingAsset: (isGenerating: boolean) => void;
   setReviewingOutput: (val: boolean) => void;
@@ -124,13 +153,14 @@ interface CoreState {
   addTask: (task: Omit<Task, 'id' | 'revisions' | 'createdAt' | 'updatedAt'>) => Task;
   removeTask: (taskId: string) => void;
   updateTaskStatus: (taskId: string, status: TaskStatus) => void;
-  submitTaskForReview: (taskId: string, draftOutput?: string) => void;
-  setTaskOutput: (taskId: string, output: string) => void;
+  submitTaskForReview: (taskId: string, draftOutput?: string, draftArtifacts?: ResearchArtifacts) => void;
+  setTaskOutput: (taskId: string, output: string, artifacts?: ResearchArtifacts) => void;
   approveTask: (taskId: string) => void;
   rejectTask: (taskId: string, comments: string) => void;
 
   // ── Actions — Log ─────────────────────────────────────────────
   addLogEntry: (entry: Omit<ActionLogEntry, 'id' | 'timestamp'>) => void;
+  addActivityEvent: (entry: Omit<ActivityLogEvent, 'id' | 'timestamp'>) => void;
   addRequestLog: (entry: Omit<RequestDebugLogEntry, 'id' | 'timestamp' | 'phase' | 'status'>) => void;
   addResponseLog: (entry: Omit<ResponseDebugLogEntry, 'id' | 'timestamp' | 'phase' | 'status'>) => void;
 
@@ -161,6 +191,7 @@ export const useCoreStore = create<CoreState>()(
       referenceImages: [],
       phase: 'idle',
       finalOutput: null,
+      finalOutputArtifacts: null,
       availableModels: [...AVAILABLE_MODELS.text],
       totalTokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
       agentTokenUsage: {},
@@ -174,6 +205,7 @@ export const useCoreStore = create<CoreState>()(
       pendingOutputParams: {},
       tasks: [],
       actionLog: [],
+      activityLog: [],
       debugLog: [],
       agentHistories: {},
       agentSummaries: {},
@@ -191,8 +223,10 @@ export const useCoreStore = create<CoreState>()(
         userBrief: '',
         phase: 'idle',
         finalOutput: null,
+        finalOutputArtifacts: null,
         tasks: [],
         actionLog: [],
+        activityLog: [],
         debugLog: [],
         agentHistories: {},
         agentSummaries: {},
@@ -220,8 +254,8 @@ export const useCoreStore = create<CoreState>()(
       })),
       clearReferenceImages: () => set({ referenceImages: [] }),
       setPhase: (phase) => set({ phase }),
-      startProject: (brief) => set({ userBrief: brief, phase: 'working', finalAssetType: 'text', finalAssetContent: null }),
-      setFinalOutput: (output) => set({ finalOutput: output }),
+      startProject: (brief) => set({ userBrief: brief, phase: 'working', finalAssetType: 'text', finalAssetContent: null, finalOutputArtifacts: null }),
+      setFinalOutput: (output, artifacts = null) => set({ finalOutput: output, finalOutputArtifacts: artifacts }),
       setFinalAsset: (type, content) => set({ finalAssetType: type, finalAssetContent: content, isGeneratingAsset: false }),
       setIsGeneratingAsset: (isGenerating) => set({ isGeneratingAsset: isGenerating }),
       setReviewingOutput: (val) => set({ isReviewingOutput: val }),
@@ -278,13 +312,14 @@ export const useCoreStore = create<CoreState>()(
           };
         }),
 
-      submitTaskForReview: (taskId, draftOutput) =>
+      submitTaskForReview: (taskId, draftOutput, draftArtifacts) =>
         set((s) => ({
           tasks: s.tasks.map((t) =>
             t.id === taskId ? { 
               ...t, 
               status: 'on_hold', 
               draftOutput,
+              draftArtifacts,
               updatedAt: Date.now() 
             } : t
           ),
@@ -301,10 +336,12 @@ export const useCoreStore = create<CoreState>()(
                 ...t, 
                 status: 'done', 
                 output: t.draftOutput || t.output,
+                artifacts: t.draftArtifacts || t.artifacts,
                 revisions: t.draftOutput 
-                  ? [...t.revisions, { output: t.draftOutput, timestamp: Date.now() }] 
+                  ? [...t.revisions, { output: t.draftOutput, artifacts: t.draftArtifacts, timestamp: Date.now() }]
                   : t.revisions,
                 draftOutput: undefined,
+                draftArtifacts: undefined,
                 updatedAt: Date.now() 
               } : t
             ),
@@ -335,9 +372,10 @@ export const useCoreStore = create<CoreState>()(
                 status: 'scheduled', 
                 reviewComments: comments,
                 revisions: t.draftOutput 
-                  ? [...t.revisions, { output: t.draftOutput, feedback: comments, timestamp: Date.now() }] 
+                  ? [...t.revisions, { output: t.draftOutput, feedback: comments, artifacts: t.draftArtifacts, timestamp: Date.now() }]
                   : t.revisions,
                 draftOutput: undefined,
+                draftArtifacts: undefined,
                 updatedAt: Date.now() 
               } : t
             ),
@@ -349,10 +387,10 @@ export const useCoreStore = create<CoreState>()(
         });
       },
 
-      setTaskOutput: (taskId, output) =>
+      setTaskOutput: (taskId, output, artifacts) =>
         set((s) => ({
           tasks: s.tasks.map((t) =>
-            t.id === taskId ? { ...t, output, updatedAt: Date.now() } : t
+            t.id === taskId ? { ...t, output, artifacts: artifacts ?? t.artifacts, updatedAt: Date.now() } : t
           ),
         })),
 
@@ -363,6 +401,18 @@ export const useCoreStore = create<CoreState>()(
             { ...entry, id: `log_${uid()}`, timestamp: Date.now() },
           ],
         })),
+
+      addActivityEvent: (entry) =>
+        set((s) => {
+          const next = [
+            ...s.activityLog,
+            { ...entry, id: `activity_${uid()}`, timestamp: Date.now() },
+          ];
+
+          return {
+            activityLog: next.length > 200 ? next.slice(-200) : next,
+          };
+        }),
       
       addRequestLog: (entry) =>
         set((s) => {
