@@ -28,13 +28,20 @@ This project is designed for **AI enthusiasts, educators, and creative developer
 npm install
 ```
 
-2. **Run the development server:**
+2. **Set environment variables for local services (optional):**
+
+```bash
+export KRONOS_API_URL=http://127.0.0.1:7070
+# Optional: export KRONOS_INTERNAL_API_KEY=your_internal_key_here
+```
+
+3. **Run the development server:**
 
 ```bash
 npm run dev
 ```
 
-3. **Open the app:** Navigate to the local URL shown in your terminal (usually `http://localhost:3000/the-delegation`).
+4. **Open the app:** Navigate to the local URL shown in your terminal (usually `http://localhost:3000/the-delegation`).
 
 ## Features
 

@@ -188,7 +188,7 @@ export class AgentBrain {
 
       // 7. Process Actions (Tools)
       for (const tc of toolCalls) {
-        const handled = ToolRegistry.process(this.host as any, tc);
+        const handled = await ToolRegistry.process(this.host as any, tc);
         this.logToolActivity(tc, allAgents, handled);
         if (tc.name === 'deliver_project' && handled) {
           this.handleFinalAssetGeneration(tc.args.output);

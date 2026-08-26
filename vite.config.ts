@@ -10,6 +10,8 @@ export default defineConfig(({mode}) => {
     plugins: [react(), tailwindcss()],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+      'process.env.KRONOS_API_URL': JSON.stringify(env.KRONOS_API_URL),
+      'process.env.KRONOS_INTERNAL_API_KEY': JSON.stringify(env.KRONOS_INTERNAL_API_KEY),
     },
     resolve: {
       alias: {

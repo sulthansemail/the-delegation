@@ -3,6 +3,7 @@ import { setUserBrief } from './tools/setUserBrief';
 import { proposeTask } from './tools/proposeTask';
 import { completeTask } from './tools/completeTask';
 import { deliverProject } from './tools/deliverProject';
+import { kronosForecast } from './tools/kronosForecast';
 import { RESEARCH_EVIDENCE_ITEM_SCHEMA, RESEARCH_FINDING_ITEM_SCHEMA } from './researchTypes';
 
 export interface ToolCall {
@@ -24,7 +25,7 @@ export class ToolRegistry {
   /**
    * Processes a tool call by dispatching it to the appropriate tool handler.
    */
-  public static process(agent: AgentActionContext, toolCall: ToolCall): boolean {
+  public static async process(agent: AgentActionContext, toolCall: ToolCall): Promise<boolean> {
     const { name, args } = toolCall;
 
     switch (name) {
@@ -36,6 +37,9 @@ export class ToolRegistry {
         return completeTask(agent, args);
       case 'deliver_project':
         return deliverProject(agent, args);
+      case 'kronos_forecast':
+        await kronosForecast(agent, args);
+        return true;
       default:
         console.warn(`[ToolRegistry] Unknown tool: ${name}`);
         return false;
@@ -115,6 +119,27 @@ export class ToolRegistry {
           }
         },
       );
+
+      if (agentIndex === 5) {
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'kronos_forecast',
+            description: 'Request an external Kronos market forecast for a stock or instrument. The model may provide only instrument_key, interval, lookback, and forecast_horizon. No Upstox tokens, no Kronos internal API keys, and no Authorization headers are allowed.',
+            parameters: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                instrument_key: { type: 'string', description: 'Instrument identifier such as NSE_EQ|INE002A01018.' },
+                interval: { type: 'string', enum: ['day', '1minute', '5minute', '15minute', '30minute'], default: 'day', description: 'Forecast interval.' },
+                lookback: { type: 'integer', minimum: 1, maximum: 512, default: 120, description: 'Historical lookback length.' },
+                forecast_horizon: { type: 'integer', minimum: 1, maximum: 128, default: 5, description: 'How many periods to forecast.' }
+              },
+              required: ['instrument_key']
+            }
+          }
+        });
+      }
 
       if (isLead) {
         tools.push({

@@ -92,18 +92,15 @@ export class PromptBuilder {
 
     if (normalizedName.includes('kronos market forecast')) {
       return `RESEARCH PROTOCOL (KRONOS MARKET FORECAST AGENT):
-- Must never claim Kronos was used unless the local Kronos engine actually returned a result.
-- If no Kronos result is supplied, output exactly: "Kronos unavailable."
-- When Kronos results are supplied, report:
-  - exact data timestamp
-  - current price
-  - 5-day forecast
-  - 10-day forecast
-  - 20-day forecast
-  - forecast distribution
-  - uncertainty
-  - historical validation status
-- Never present forecast as certainty.`;
+- Kronos is an external forecasting service.
+- Use it only when a real Kronos request is appropriate for the instrument and time horizon.
+- Do not fabricate a Kronos forecast or invent a price path.
+- The model may provide only: instrument_key, interval, lookback, forecast_horizon.
+- Never provide Upstox tokens, Kronos internal API keys, or Authorization headers.
+- If Kronos is unavailable, explicitly state: "Kronos forecast unavailable."
+- Do not claim Kronos was used unless the tool actually returned success.
+- Clearly distinguish Kronos output from fundamental research and established annual-report facts.
+- Do not treat a forecast as a certainty or guaranteed prediction.`;
     }
 
     if (normalizedName.includes('risk and portfolio')) {

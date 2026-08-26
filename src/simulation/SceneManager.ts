@@ -16,6 +16,7 @@ import { getActiveAgentSet, useTeamStore } from '../integration/store/teamStore'
 import { useUiStore } from '../integration/store/uiStore';
 import { AgentBehavior, ChatMessage } from '../types';
 import { BUBBLE_Y_OFFSET } from './constants';
+import { getDeterministicAnswer } from '../core/deterministic/deterministicAnswer';
 
 /**
  * SceneManager — Visual Integration Layer.
@@ -223,6 +224,15 @@ export class SceneManager {
     useCoreStore.setState((s) => ({
       agentHistories: { ...s.agentHistories, [selectedNpcIndex!]: [...(s.agentHistories[selectedNpcIndex!] || []), { role: 'user', content: text }] }
     }));
+
+    const deterministicAnswer = getDeterministicAnswer(text);
+    if (deterministicAnswer !== null) {
+      useCoreStore.setState((s) => ({
+        agentHistories: { ...s.agentHistories, [selectedNpcIndex!]: [...(s.agentHistories[selectedNpcIndex!] || []), { role: 'assistant', content: deterministicAnswer }] }
+      }));
+      return;
+    }
+
     useUiStore.setState({ isThinking: true, isTyping: false });
     try {
       if (this.coreHandler) await this.coreHandler(selectedNpcIndex!, text);
