@@ -4,6 +4,7 @@ import { proposeTask } from './tools/proposeTask';
 import { completeTask } from './tools/completeTask';
 import { deliverProject } from './tools/deliverProject';
 import { kronosForecast } from './tools/kronosForecast';
+import { getHistoricalMarketData } from './tools/marketData';
 import { RESEARCH_EVIDENCE_ITEM_SCHEMA, RESEARCH_FINDING_ITEM_SCHEMA } from './researchTypes';
 
 export interface ToolCall {
@@ -40,6 +41,9 @@ export class ToolRegistry {
       case 'kronos_forecast':
         await kronosForecast(agent, args);
         return true;
+      case 'get_historical_market_data':
+        await getHistoricalMarketData(args);
+        return true;    
       default:
         console.warn(`[ToolRegistry] Unknown tool: ${name}`);
         return false;
@@ -91,6 +95,53 @@ export class ToolRegistry {
           }
         });
       }
+      tools.push({
+  type: 'function',
+  function: {
+    name: 'get_historical_market_data',
+    description:
+      'Download current historical OHLCV market data for an NSE stock using the local Mac Python/yfinance environment. The data is saved locally and returned as structured metadata. Use this before performing technical or quantitative analysis that requires historical price data.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        symbol: {
+          type: 'string',
+          description:
+            'NSE stock symbol, for example BEPL, TCS, INFY, or CASTROLIND.'
+        },
+        period: {
+          type: 'string',
+          enum: [
+            '1mo',
+            '3mo',
+            '6mo',
+            '1y',
+            '2y',
+            '5y',
+            '10y',
+            'max'
+          ],
+          default: '5y',
+          description:
+            'Historical period to download.'
+        },
+        interval: {
+          type: 'string',
+          enum: [
+            '1d',
+            '1wk',
+            '1mo'
+          ],
+          default: '1d',
+          description:
+            'Historical candle interval.'
+        }
+      },
+      required: ['symbol']
+    }
+  }
+});
 
       tools.push(
         {

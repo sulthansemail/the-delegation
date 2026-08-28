@@ -18,6 +18,14 @@ import { AgentBehavior, ChatMessage } from '../types';
 import { BUBBLE_Y_OFFSET } from './constants';
 import { getDeterministicAnswer } from '../core/deterministic/deterministicAnswer';
 
+import {
+  getHistoricalMarketData,
+} from '../core/agent/tools/marketData';
+
+import {
+  getMarketDataIntent,
+} from '../core/deterministic/marketDataIntent';
+
 /**
  * SceneManager — Visual Integration Layer.
  * 
@@ -231,6 +239,70 @@ export class SceneManager {
         agentHistories: { ...s.agentHistories, [selectedNpcIndex!]: [...(s.agentHistories[selectedNpcIndex!] || []), { role: 'assistant', content: deterministicAnswer }] }
       }));
       return;
+    }
+    
+    const marketDataIntent = getMarketDataIntent(text);
+
+      if (marketDataIntent !== null) {
+        useUiStore.setState({
+          isThinking: true,
+          isTyping: false,
+        });
+
+        try {
+          const result = await getHistoricalMarketData(
+            marketDataIntent
+          );
+
+          const content = result.success
+            ? [
+                `Historical market data retrieved for ${result.symbol}.`,
+                `Rows: ${result.rows ?? 'unknown'}`,
+                `First date: ${result.firstDate ?? 'unknown'}`,
+                `Last date: ${result.lastDate ?? 'unknown'}`,
+                `File: ${result.file ?? 'unknown'}`,
+              ].join('\n')
+            : `Market-data request failed: ${result.error ?? 'Unknown error.'}`;
+
+          useCoreStore.setState((s) => ({
+            agentHistories: {
+              ...s.agentHistories,
+              [selectedNpcIndex!]: [
+                ...(s.agentHistories[selectedNpcIndex!] || []),
+                {
+                  role: 'assistant',
+                  content,
+                },
+              ],
+            },
+          }));
+        } catch (err) {
+          console.error(
+            '[SceneManager] market data error:',
+            err
+          );
+
+          useCoreStore.setState((s) => ({
+            agentHistories: {
+              ...s.agentHistories,
+              [selectedNpcIndex!]: [
+                ...(s.agentHistories[selectedNpcIndex!] || []),
+                {
+                  role: 'assistant',
+                  content:
+                    'Unable to retrieve historical market data.',
+                },
+              ],
+            },
+          }));
+        } finally {
+          useUiStore.setState({
+            isThinking: false,
+            isTyping: false,
+          });
+        }
+
+        return;
     }
 
     useUiStore.setState({ isThinking: true, isTyping: false });
