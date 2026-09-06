@@ -2,6 +2,7 @@ import { AgentNode } from '../../data/agents';
 import { LLMMessage } from '../../core/llm/types';
 import { AgentState } from '../../types';
 import { useUiStore } from '../../integration/store/uiStore';
+import { useCoreStore } from '../../integration/store/coreStore';
 import { AgentActionContext } from '../../core/agent/ToolRegistry';
 import { AgentBrain, BrainHost } from '../../core/agent/AgentBrain';
 
@@ -14,6 +15,12 @@ export class AgentHost implements AgentActionContext, BrainHost {
     public readonly data: AgentNode,
     public readonly simulation: any // We'll type this properly later
   ) {
+    const core = useCoreStore.getState();
+    const activeTask = core.tasks.find(task => task.assignedAgentId === data.index && (task.status === 'in_progress' || task.status === 'on_hold'));
+    this.currentTaskId = activeTask?.id ?? null;
+    this.state = core.agentExecutionStates[data.index]
+      ?? (activeTask?.status === 'on_hold' ? 'on_hold' : activeTask ? 'working' : 'idle');
+    useUiStore.getState().setAgentStatus(data.index, this.state);
     this.brain = new AgentBrain(this);
   }
 
@@ -54,6 +61,7 @@ export class AgentHost implements AgentActionContext, BrainHost {
   public setState(state: AgentState) {
     this.state = state;
     useUiStore.getState().setAgentStatus(this.data.index, state);
+    useCoreStore.getState().setAgentExecutionState(this.data.index, state);
   }
 
   public appendHistory(message: LLMMessage) {

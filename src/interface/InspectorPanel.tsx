@@ -195,6 +195,18 @@ const InspectorPanel: React.FC<InspectorPanelProps> = ({ isFloating }) => {
                         <FolderOpen size={14} strokeWidth={3} />
                         View Final Output
                       </button>
+                      <button
+                        onClick={handleStartChat}
+                        disabled={!canChat}
+                        title={!canChat ? reason : undefined}
+                        className={`w-full h-10 px-4 rounded-xl flex items-center justify-center gap-2 transition-all active:scale-95 text-[10px] font-black uppercase tracking-widest ${canChat
+                            ? 'bg-darkDelegation text-white border-none shadow-md'
+                            : 'bg-zinc-50 text-zinc-300 border border-transparent cursor-not-allowed'
+                          }`}
+                      >
+                        <MessageSquare size={13} className={canChat ? 'text-white' : 'opacity-40'} />
+                        Ask Follow-up
+                      </button>
                     </div>
                   ) : isChatting ? (
                     null

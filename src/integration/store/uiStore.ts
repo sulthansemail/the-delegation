@@ -4,6 +4,51 @@ import { AgentState, CharacterState } from '../../types';
 import { useTeamStore, getActiveAgentSet } from './teamStore';
 import { DEFAULT_MODELS } from '../../core/llm/constants';
 
+// NUCLEAR SANITIZATION: Run synchronously at module load time before anything else
+(() => {
+  try {
+    // Wipe BYOK config completely if it has ANY old model reference
+    const byokData = localStorage.getItem('byok-config');
+    if (byokData) {
+      try {
+        const parsed = JSON.parse(byokData);
+        const modelStr = String(parsed?.model || '');
+        // If it contains any known old reference, nuke it all
+        if (
+          modelStr.includes('2.5-flash-lite') ||
+          modelStr.includes('veo-3') ||
+          modelStr.includes('gemini-1.5')
+        ) {
+          localStorage.removeItem('byok-config');
+        }
+      } catch {
+        localStorage.removeItem('byok-config');
+      }
+    }
+
+    // Wipe team-storage completely if it has ANY old model reference
+    const teamData = localStorage.getItem('team-storage');
+    if (teamData) {
+      try {
+        if (teamData.includes('2.5-flash-lite') || teamData.includes('gemini-3.') || teamData.includes('veo-3') || teamData.includes('preview')) {
+          localStorage.removeItem('team-storage');
+        }
+      } catch {
+        localStorage.removeItem('team-storage');
+      }
+    }
+  } catch { }
+})();
+
+const normalizeStoredModel = (model?: string): string => {
+  const previousFlashDefault = DEFAULT_MODELS.text.replace('-preview', '');
+  if (model === previousFlashDefault) return DEFAULT_MODELS.text;
+  if (typeof model === 'string' && model.trim().length > 0) return model;
+  return DEFAULT_MODELS.text;
+};
+
+
+
 export const useUiStore = create<CharacterState>()(
   (set) => ({
     isThinking: false,
@@ -36,7 +81,13 @@ export const useUiStore = create<CharacterState>()(
     llmConfig: (() => {
       try {
         const saved = localStorage.getItem('byok-config');
-        if (saved) return JSON.parse(saved);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          return {
+            apiKey: typeof parsed?.apiKey === 'string' ? parsed.apiKey : '',
+            model: normalizeStoredModel(parsed?.model),
+          };
+        }
       } catch { }
       return {
         apiKey: '',
@@ -66,7 +117,13 @@ export const useUiStore = create<CharacterState>()(
       hoverPosition: pos,
       hoveredNpcIndex: null,
     }),
-    setLlmConfig: (config) => set((s) => ({ llmConfig: { ...s.llmConfig, ...config } })),
+    setLlmConfig: (config) => set((s) => ({
+      llmConfig: {
+        ...s.llmConfig,
+        ...config,
+        model: normalizeStoredModel(config.model || s.llmConfig.model),
+      },
+    })),
     setChatting: (isChatting: boolean) => set((s) => ({ 
       isChatting, 
       isTyping: isChatting ? s.isTyping : false,

@@ -7,6 +7,16 @@ import { ToolRegistry } from './ToolRegistry';
 import { PromptBuilder } from './PromptBuilder';
 import { AGENTIC_SETS, AgentNode } from '../../data/agents';
 import { GroundingCitation } from './researchTypes';
+import { DEFAULT_MODELS } from '../llm/constants';
+import { formatMarketSnapshotForAgent, getMarketSnapshot } from '../market/marketDataService';
+import { calculatePositionState } from '../market/positionState';
+
+const normalizeSupportedModel = (model: any): string => {
+  if (typeof model === 'string' && model.trim().length > 0) {
+    return model;
+  }
+  return DEFAULT_MODELS.text;
+};
 
 export interface BrainHost {
   data: AgentNode;
@@ -41,7 +51,7 @@ export class AgentBrain {
       const llmConfig = useUiStore.getState().llmConfig;
       if (!llmConfig.apiKey) throw new Error('Gemini API key is required');
       const provider = new GeminiProvider(llmConfig.apiKey);
-      const model = this.host.data.model || llmConfig.model;
+      const model = normalizeSupportedModel(this.host.data.model || llmConfig.model);
       const currentTaskId = this.host.getCurrentTaskId() || undefined;
       const teamId = useTeamStore.getState().selectedAgentSetId;
       const activeTeam = useTeamStore.getState().customSystems.find(s => s.id === teamId)
@@ -84,7 +94,75 @@ export class AgentBrain {
         });
       }
       const allAgents = this.host.simulation.getAllAgents();
-      const systemPrompt = PromptBuilder.buildSystemPrompt(this.host.data, core.phase, core.userBrief, allAgents);
+      const portfolioContext = core.portfolio.length > 0
+        ? `PROJECT PORTFOLIO (from The Delegation persisted state; project-level, not brokerage access)
+    ${core.portfolio.map((holding) => `- ${holding.symbol}: quantity=${holding.quantity}, average_purchase_price=${holding.averagePrice}`).join('\n')}
+    Use these stored positions directly when the user asks about portfolio/holdings.`
+        : `PROJECT PORTFOLIO
+    No portfolio positions are currently stored in The Delegation for this project.
+    If asked about portfolio/holdings, state that no local positions are stored yet and ask the user to add them in the app.`;
+
+      const portfolioBoundaryInstruction = `PORTFOLIO ACCESS BOUNDARY (MANDATORY)
+    - You can access portfolio data stored inside The Delegation project context.
+    - You do NOT have access to external brokerage/private financial accounts.
+    - Never ask for broker credentials.
+    - Do not claim portfolio data is unavailable when project portfolio entries are present.`;
+
+      let marketDataContext = '';
+      if (core.selectedSymbol && (core.phase === 'working' || (isLead && options.isChat))) {
+        const snapshotResult = await getMarketSnapshot(core.selectedSymbol);
+        if (snapshotResult.success === false) {
+          core.recordRunMarketSnapshot({
+            source: 'yfinance',
+            requestedBy: `agent:${this.host.data.index}`,
+            symbol: snapshotResult.failure.symbol,
+            retrievedAt: snapshotResult.failure.retrievedAt,
+            error: snapshotResult.failure.error,
+          });
+        } else {
+          core.recordRunMarketSnapshot({
+            source: 'yfinance',
+            requestedBy: `agent:${this.host.data.index}`,
+            symbol: snapshotResult.snapshot.symbol,
+            historicalPeriod: snapshotResult.snapshot.historicalPeriod,
+            interval: snapshotResult.snapshot.interval,
+            retrievedAt: snapshotResult.snapshot.retrievedAt,
+            latestMarketTimestamp: snapshotResult.snapshot.latestMarketTimestamp,
+            currentPrice: snapshotResult.snapshot.currentPrice,
+            trendState: snapshotResult.snapshot.trendState,
+            support: snapshotResult.snapshot.support,
+            resistance: snapshotResult.snapshot.resistance,
+            week52High: snapshotResult.snapshot.week52High,
+            week52Low: snapshotResult.snapshot.week52Low,
+            indicators: {
+              close: snapshotResult.snapshot.indicators.close,
+              sma20: snapshotResult.snapshot.indicators.sma20,
+              sma50: snapshotResult.snapshot.indicators.sma50,
+              sma200: snapshotResult.snapshot.indicators.sma200,
+              rsi14: snapshotResult.snapshot.indicators.rsi14,
+              macd: snapshotResult.snapshot.indicators.macd,
+              macdSignal: snapshotResult.snapshot.indicators.macdSignal,
+              macdHistogram: snapshotResult.snapshot.indicators.macdHistogram,
+              relativeVolume20: snapshotResult.snapshot.indicators.relativeVolume20,
+            },
+          });
+        }
+        marketDataContext = formatMarketSnapshotForAgent(snapshotResult);
+
+        if (this.host.data.name.toLowerCase().includes('risk and portfolio') && snapshotResult.success) {
+          const holding = core.portfolio.find(entry => entry.symbol === snapshotResult.snapshot.symbol);
+          if (holding) {
+            const position = calculatePositionState({
+              symbol: holding.symbol,
+              quantity: holding.quantity,
+              averagePrice: holding.averagePrice,
+              currentPrice: snapshotResult.snapshot.currentPrice,
+            });
+            marketDataContext += `\n\nPERSISTED POSITION + LIVE YFINANCE PRICE\nQuantity: ${position.quantity}\nAverage cost: ${position.averagePrice}\nCurrent position value: ${position.marketValue}\nUnrealized P/L: ${position.unrealizedPnL} (${position.unrealizedPnLPercent}%)\nKeep purchase-price decisions separate from the underlying technical signal.`;
+          }
+        }
+      }
+      const systemPrompt = `${PromptBuilder.buildSystemPrompt(this.host.data, core.phase, core.userBrief, allAgents)}\n\n${portfolioBoundaryInstruction}\n\n${portfolioContext}${marketDataContext ? `\n\n${marketDataContext}` : ''}`;
       const toolDefs = options.tools || ToolRegistry.getDefinitions(this.host.data.index, core.phase, this.host.data.subagents?.length || 0);
 
       if (options.isChat && !options.silent && isLead && core.phase === 'idle') {
@@ -276,7 +354,7 @@ export class AgentBrain {
       const llmConfig = useUiStore.getState().llmConfig;
       if (!llmConfig.apiKey) throw new Error('Gemini API key is required');
       const provider = new GeminiProvider(llmConfig.apiKey) as any;
-      const model = options.model || activeTeam.outputModel || llmConfig.model;
+      const model = normalizeSupportedModel(options.model || activeTeam.outputModel || llmConfig.model);
 
       core.addLogEntry({
         agentIndex: -1,

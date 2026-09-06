@@ -17,9 +17,13 @@ export class AgentSimulation {
   private unsubs: (() => void)[] = [];
   private heartbeatInterval: any = null;
   private lastSparkTriggerTime: number = 0;
+  // A restored project is a snapshot, not an instruction to repeat paid agent work.
+  // Automation is enabled only by a new idle → working project transition.
+  private automationEnabled: boolean;
 
   constructor(system: AgenticSystem) {
     this.system = system;
+    this.automationEnabled = useCoreStore.getState().phase === 'idle';
     this.initializeAgents();
     this.startStateMonitoring();
   }
@@ -28,6 +32,7 @@ export class AgentSimulation {
     // 1. Heartbeat safety net (Periodically check for scheduled tasks and empty boards)
     this.heartbeatInterval = setInterval(() => {
       const state = useCoreStore.getState();
+      if (!this.automationEnabled) return;
       if (state.phase === 'working' && state.tasks.length === 0) {
         this.triggerAutonomousStrategy();
       } else if (state.phase === 'working') {
@@ -38,18 +43,37 @@ export class AgentSimulation {
     // 2. Core Store Monitoring
     this.unsubs.push(
       useCoreStore.subscribe((state, prevState) => {
+        const runChanged = state.currentRunId !== prevState.currentRunId;
+        if (state.phase === 'working' && (prevState.phase === 'idle' || (prevState.phase === 'done' && runChanged))) {
+          this.automationEnabled = true;
+        }
+
+        // Log/history updates are notifications, not project lifecycle changes.
+        // In particular, an activity emitted while synthesizing must not be able to
+        // synchronously re-enter project completion.
+        const phaseChanged = state.phase !== prevState.phase;
+        const assetGenerationChanged = state.isGeneratingAsset !== prevState.isGeneratingAsset;
+        const taskLifecycleChanged = state.tasks.length !== prevState.tasks.length
+          || state.tasks.some(task => {
+            const previousTask = prevState.tasks.find(candidate => candidate.id === task.id);
+            return !previousTask || previousTask.status !== task.status;
+          });
+
         // A. Initial Strategy (Spark)
-        if (state.phase === 'working' && prevState.phase === 'idle' && state.tasks.length === 0) {
+        if (this.automationEnabled && state.phase === 'working' && prevState.phase === 'idle' && state.tasks.length === 0) {
           this.triggerAutonomousStrategy();
         }
 
         // B. Task Lifecycle: Process SCHEDULED tasks
-        if (state.phase === 'working') {
+        if (this.automationEnabled && state.phase === 'working' && (phaseChanged || taskLifecycleChanged)) {
           this.processScheduledTasks();
         }
 
-        // C. Project Completion
-        this.checkProjectCompletion();
+        // C. Project Completion.  Do not run this for activity, request, response,
+        // or history notifications; they are emitted by the conclusion workflow.
+        if (this.automationEnabled && (phaseChanged || taskLifecycleChanged || assetGenerationChanged)) {
+          void this.checkProjectCompletion();
+        }
       })
     );
 
@@ -66,6 +90,7 @@ export class AgentSimulation {
 
   /** Central method to check for and start available tasks. */
   public processScheduledTasks() {
+    if (!this.automationEnabled) return;
     const state = useCoreStore.getState();
     if (state.phase !== 'working') return;
 
@@ -128,12 +153,17 @@ export class AgentSimulation {
   }
 
   private async checkProjectCompletion() {
+    if (!this.automationEnabled) return;
     const state = useCoreStore.getState();
     const allTasksFinished = state.tasks.length > 0 && state.tasks.every(t => t.status === 'done');
     
-    if (state.phase === 'working' && allTasksFinished && !state.isGeneratingAsset) {
+    if (state.phase === 'working' && allTasksFinished && !state.isGeneratingAsset && !state.completionInProgress) {
       const lead = this.getAgent(this.system.leadAgent.index);
       if (lead && !lead.isThinking) {
+        // This mutation deliberately happens before concludeProject() logs its first
+        // activity event. Zustand subscribers are synchronous, so the guard must be
+        // visible before reviewing_result/synthesizing is emitted.
+        useCoreStore.getState().setCompletionInProgress(true);
         await lead.concludeProject();
       }
     }

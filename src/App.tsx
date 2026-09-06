@@ -15,6 +15,9 @@ import SimulationView from './interface/SimulationView';
 import { VisualConfigurator } from './interface/VisualConfigurator/VisualConfigurator';
 import { SceneContext } from './simulation/SceneContext';
 import { SceneManager } from './simulation/SceneManager';
+import { MarketAnalysisPanel } from './interface/MarketAnalysisPanel';
+import { PortfolioPanel } from './interface/PortfolioPanel';
+
 
 
 const App: React.FC = () => {
@@ -25,6 +28,7 @@ const App: React.FC = () => {
 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [kanbanHeight, setKanbanHeight] = useState(220);
+  const [activeBottomTab, setActiveBottomTab] = useState<'kanban' | 'market'>('kanban');
 
   const startResizing = useCallback(() => {
     setIsResizing(true);
@@ -101,7 +105,49 @@ const App: React.FC = () => {
                 </div>
               )}
 
-              {isKanbanOpen && !isFullscreen && <KanbanPanel height={kanbanHeight} />}
+              {isKanbanOpen && !isFullscreen && (
+                <div className="flex-none bg-white border-t border-zinc-200">
+                  {/* Tab Bar */}
+                  <div className="flex items-center gap-4 px-4 py-2 border-b border-zinc-200">
+                    <button
+                      onClick={() => setActiveBottomTab('kanban')}
+                      className={`py-1 text-sm font-medium transition-colors ${
+                        activeBottomTab === 'kanban'
+                          ? 'text-blue-600 border-b-2 border-blue-600'
+                          : 'text-zinc-500 hover:text-zinc-700'
+                      }`}
+                    >
+                      Tasks
+                    </button>
+                    <button
+                      onClick={() => setActiveBottomTab('market')}
+                      className={`py-1 text-sm font-medium transition-colors ${
+                        activeBottomTab === 'market'
+                          ? 'text-blue-600 border-b-2 border-blue-600'
+                          : 'text-zinc-500 hover:text-zinc-700'
+                      }`}
+                    >
+                      Market Analysis
+                    </button>
+                  </div>
+
+                  {/* Panel Content */}
+                  <div
+                    className="overflow-auto"
+                    style={{ height: `${kanbanHeight}px` }}
+                  >
+                    {activeBottomTab === 'kanban' && (
+                      <KanbanPanel height={kanbanHeight} />
+                    )}
+                    {activeBottomTab === 'market' && (
+                      <div className="p-4 space-y-4">
+                        <PortfolioPanel />
+                        <MarketAnalysisPanel />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 

@@ -6,6 +6,7 @@ import {
   KronosForecastResult,
 } from '../../../core/integration/kronosClient';
 import type { KronosInterval } from '../../../core/integration/kronosClient';
+import { formatMarketSnapshotForAgent, getMarketSnapshot } from '../../market/marketDataService';
 
 export type { KronosInterval } from '../../../core/integration/kronosClient';
 
@@ -55,6 +56,51 @@ export async function kronosForecast(agent: AgentActionContext, args: Partial<Kr
     message: `${agentName} requesting Kronos forecast.`
   });
 
+  // Kronos interprets an external forecast alongside a deterministic, current
+  // yfinance snapshot. It never supplies or invents the current OHLCV values.
+  const marketSnapshot = await getMarketSnapshot(store.selectedSymbol);
+  if (marketSnapshot.success === false) {
+    store.recordRunMarketSnapshot({
+      source: 'yfinance',
+      requestedBy: `kronos:${agent.data.index}`,
+      symbol: marketSnapshot.failure.symbol,
+      retrievedAt: marketSnapshot.failure.retrievedAt,
+      error: marketSnapshot.failure.error,
+    });
+  } else {
+    store.recordRunMarketSnapshot({
+      source: 'yfinance',
+      requestedBy: `kronos:${agent.data.index}`,
+      symbol: marketSnapshot.snapshot.symbol,
+      historicalPeriod: marketSnapshot.snapshot.historicalPeriod,
+      interval: marketSnapshot.snapshot.interval,
+      retrievedAt: marketSnapshot.snapshot.retrievedAt,
+      latestMarketTimestamp: marketSnapshot.snapshot.latestMarketTimestamp,
+      currentPrice: marketSnapshot.snapshot.currentPrice,
+      trendState: marketSnapshot.snapshot.trendState,
+      support: marketSnapshot.snapshot.support,
+      resistance: marketSnapshot.snapshot.resistance,
+      week52High: marketSnapshot.snapshot.week52High,
+      week52Low: marketSnapshot.snapshot.week52Low,
+      indicators: {
+        close: marketSnapshot.snapshot.indicators.close,
+        sma20: marketSnapshot.snapshot.indicators.sma20,
+        sma50: marketSnapshot.snapshot.indicators.sma50,
+        sma200: marketSnapshot.snapshot.indicators.sma200,
+        rsi14: marketSnapshot.snapshot.indicators.rsi14,
+        macd: marketSnapshot.snapshot.indicators.macd,
+        macdSignal: marketSnapshot.snapshot.indicators.macdSignal,
+        macdHistogram: marketSnapshot.snapshot.indicators.macdHistogram,
+        relativeVolume20: marketSnapshot.snapshot.indicators.relativeVolume20,
+      },
+    });
+  }
+  agent.appendHistory({
+    role: 'tool',
+    name: 'get_market_snapshot',
+    content: formatMarketSnapshotForAgent(marketSnapshot),
+  });
+
   if ('status' in normalized) {
     store.addActivityEvent({
       agentIndex: agent.data.index,
@@ -101,7 +147,17 @@ export async function kronosForecast(agent: AgentActionContext, args: Partial<Kr
     });
 
     const evidence = result.forecast.length
-      ? [buildEvidence(result.instrumentKey, result.interval, result.forecast)]
+      ? [
+          buildEvidence(result.instrumentKey, result.interval, result.forecast),
+          ...(marketSnapshot.success ? [{
+            claim: `Current market snapshot for ${marketSnapshot.snapshot.symbol}`,
+            value: formatMarketSnapshotForAgent(marketSnapshot),
+            source: 'yfinance',
+            sourceType: 'other' as const,
+            confidence: 'high' as const,
+            status: 'inference' as const,
+          }] : []),
+        ]
       : undefined;
 
     const toolResult = {

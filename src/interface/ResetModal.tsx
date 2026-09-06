@@ -38,8 +38,8 @@ const ResetModal: React.FC<ResetModalProps> = ({ isOpen, onClose, onConfirm }) =
           </div>
 
           <p className="text-sm text-zinc-500 leading-relaxed mb-8">
-            This will clear the current user brief, all tasks, logs, and conversation histories.
-            The team will return to their starting positions and the project will revert to idle.
+            This starts a completely separate project: a new brief, portfolio, chat, and all
+            analysis runs. The current project's data is not deleted, but it will no longer be active.
           </p>
 
           <div className="flex flex-col gap-3">

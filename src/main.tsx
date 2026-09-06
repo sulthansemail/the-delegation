@@ -2,6 +2,7 @@
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import './index.css';
+import { initializeFirestorePersistence } from './integration/persistence/firestorePersistence';
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {
@@ -9,6 +10,12 @@ if (!rootElement) {
 }
 
 const root = ReactDOM.createRoot(rootElement);
-root.render(
-  <App />
-);
+
+async function bootstrap() {
+  await initializeFirestorePersistence();
+  root.render(
+    <App />
+  );
+}
+
+void bootstrap();

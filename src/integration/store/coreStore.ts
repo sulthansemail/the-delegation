@@ -6,6 +6,8 @@ import { DEFAULT_MODELS, AVAILABLE_MODELS } from '../../core/llm/constants';
 import { calculateCost } from '../../core/llm/pricing';
 import { useTeamStore } from './teamStore';
 import { useUiStore } from './uiStore';
+import { useMarketStore } from './marketStore';
+import { AgentState } from '../../types';
 
 export type TaskStatus = 'scheduled' | 'on_hold' | 'in_progress' | 'done'
 
@@ -32,6 +34,13 @@ export interface Task {
   revisions: TaskRevision[]
   createdAt: number
   updatedAt: number
+}
+
+export interface PortfolioHolding {
+  id: string
+  symbol: string
+  quantity: number
+  averagePrice: number
 }
 
 export interface ActionLogEntry {
@@ -93,11 +102,72 @@ export type DebugLogEntry = RequestDebugLogEntry | ResponseDebugLogEntry;
 
 export type ProjectPhase = 'idle' | 'working' | 'done'
 
+export interface RunSummary {
+  runId: string
+  runNumber: number
+  status: ProjectPhase
+  createdAt: number
+  updatedAt: number
+  completedAt: number | null
+  symbol: string
+}
+
+export interface RunMarketSnapshotRecord {
+  id: string
+  runId: string
+  capturedAt: number
+  source: 'yfinance'
+  requestedBy: string
+  symbol: string
+  historicalPeriod?: string
+  interval?: string
+  retrievedAt: string
+  latestMarketTimestamp?: string
+  currentPrice?: number
+  trendState?: string
+  support?: number | null
+  resistance?: number | null
+  week52High?: number
+  week52Low?: number
+  indicators?: Record<string, any>
+  error?: string
+}
+
+export interface RunAnalysisRecord {
+  id: string
+  runId: string
+  symbol: string
+  timestamp: number
+  decision: any | null
+  currentPrice?: number
+  latestDate?: string
+  error: string | null
+}
+
 interface CoreState {
   // ── Project ──────────────────────────────────────────────────
+  projectId: string | null
+  projectName: string | null
+  pendingProjectName: string
+  projectTeamId: string | null
+  projectCreatedAt: number | null
+  projectUpdatedAt: number | null
   userBrief: string
   referenceImages: string[]
   phase: ProjectPhase
+  currentRunId: string | null
+  currentRunNumber: number
+  currentRunCreatedAt: number | null
+  currentRunUpdatedAt: number | null
+  currentRunCompletedAt: number | null
+  runHistory: RunSummary[]
+  runMarketSnapshots: RunMarketSnapshotRecord[]
+  runAnalyses: RunAnalysisRecord[]
+  /**
+   * Set synchronously before the lead starts final synthesis.  `phase === 'done'`
+   * represents a delivered project; this flag covers the interval before delivery.
+   */
+  completionInProgress: boolean
   finalOutput: string | null
   finalOutputArtifacts: ResearchArtifacts | null
   availableModels: string[]
@@ -126,6 +196,7 @@ interface CoreState {
   agentHistories: Record<number, LLMMessage[]>
   agentSummaries: Record<number, string>
   boardroomHistories: Record<string, LLMMessage[]>
+  agentExecutionStates: Record<number, AgentState>
 
   // ── UI ───────────────────────────────────────────────────────
   isKanbanOpen: boolean
@@ -134,6 +205,8 @@ interface CoreState {
   isFinalOutputOpen: boolean;
   logFilterAgentIndex: number | null;
   isResizing: boolean;
+  selectedSymbol: string
+  portfolio: PortfolioHolding[]
 
   // ── Actions — Project —————————————————————————————————────────
   setUserBrief: (brief: string) => void;
@@ -141,13 +214,18 @@ interface CoreState {
   removeReferenceImage: (index: number) => void;
   clearReferenceImages: () => void;
   setPhase: (phase: ProjectPhase) => void;
+  setCompletionInProgress: (inProgress: boolean) => void;
+  setPendingProjectName: (name: string) => void;
   startProject: (brief: string) => void;
+  startNewRun: () => void;
   setFinalOutput: (output: string, artifacts?: ResearchArtifacts | null) => void;
   setFinalAsset: (type: 'image' | 'audio' | 'video', content: string) => void;
   setIsGeneratingAsset: (isGenerating: boolean) => void;
   setReviewingOutput: (val: boolean) => void;
   setPendingOutputPrompt: (prompt: string) => void;
   setPendingOutputParams: (params: any) => void;
+  recordRunMarketSnapshot: (entry: Omit<RunMarketSnapshotRecord, 'id' | 'capturedAt' | 'runId'>) => void;
+  recordRunAnalysis: (entry: Omit<RunAnalysisRecord, 'id' | 'runId' | 'timestamp'>) => void;
 
   // ── Actions — Tasks ───────────────────────────────────────────
   addTask: (task: Omit<Task, 'id' | 'revisions' | 'createdAt' | 'updatedAt'>) => Task;
@@ -175,11 +253,16 @@ interface CoreState {
   setLogOpen: (open: boolean, filterAgent?: number | null) => void;
   setFinalOutputOpen: (open: boolean) => void;
   setIsResizing: (isResizing: boolean) => void;
+  setSelectedSymbol: (symbol: string) => void;
+  addPortfolioHolding: (holding: Omit<PortfolioHolding, 'id'>) => void;
+  updatePortfolioHolding: (id: string, holding: Partial<Omit<PortfolioHolding, 'id'>>) => void;
+  removePortfolioHolding: (id: string) => void;
   resetProject: () => void;
   setViewMode: (mode: 'simulation' | 'design') => void;
 
   // ── Simulation Sync ──────────────────────────────────────────
   setAgentHistory: (agentIndex: number, history: LLMMessage[]) => void;
+  setAgentExecutionState: (agentIndex: number, state: AgentState) => void;
 }
 
 const uid = () => `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
@@ -187,9 +270,24 @@ const uid = () => `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
 export const useCoreStore = create<CoreState>()(
   persist(
     (set) => ({
+      projectId: null,
+      projectName: null,
+      pendingProjectName: '',
+      projectTeamId: null,
+      projectCreatedAt: null,
+      projectUpdatedAt: null,
       userBrief: '',
       referenceImages: [],
       phase: 'idle',
+      currentRunId: null,
+      currentRunNumber: 0,
+      currentRunCreatedAt: null,
+      currentRunUpdatedAt: null,
+      currentRunCompletedAt: null,
+      runHistory: [],
+      runMarketSnapshots: [],
+      runAnalyses: [],
+      completionInProgress: false,
       finalOutput: null,
       finalOutputArtifacts: null,
       availableModels: [...AVAILABLE_MODELS.text],
@@ -210,18 +308,67 @@ export const useCoreStore = create<CoreState>()(
       agentHistories: {},
       agentSummaries: {},
       boardroomHistories: {},
+      agentExecutionStates: {},
       isKanbanOpen: true,
       isLogOpen: true,
       isFinalOutputOpen: false,
       logFilterAgentIndex: null,
       isResizing: false,
       viewMode: 'simulation',
+      selectedSymbol: 'BEPL',
+      portfolio: [],
 
       setViewMode: (viewMode) => set({ viewMode }),
+      setSelectedSymbol: (symbol) => set({ selectedSymbol: symbol.trim().toUpperCase() || 'BEPL', currentRunUpdatedAt: Date.now(), projectUpdatedAt: Date.now() }),
+      addPortfolioHolding: (holding) => set((s) => ({
+        portfolio: [
+          ...s.portfolio,
+          {
+            ...holding,
+            symbol: holding.symbol.trim().toUpperCase(),
+            id: uid(),
+          },
+        ],
+        currentRunUpdatedAt: Date.now(),
+        projectUpdatedAt: Date.now(),
+      })),
+      updatePortfolioHolding: (id, holding) => set((s) => ({
+        portfolio: s.portfolio.map((entry) =>
+          entry.id === id
+            ? {
+                ...entry,
+                ...holding,
+                ...(holding.symbol ? { symbol: holding.symbol.trim().toUpperCase() } : {}),
+              }
+            : entry
+        ),
+        currentRunUpdatedAt: Date.now(),
+        projectUpdatedAt: Date.now(),
+      })),
+      removePortfolioHolding: (id) => set((s) => ({
+        portfolio: s.portfolio.filter((entry) => entry.id !== id),
+        currentRunUpdatedAt: Date.now(),
+        projectUpdatedAt: Date.now(),
+      })),
 
       resetProject: () => set({
+        projectId: null,
+        projectName: null,
+        pendingProjectName: '',
+        projectTeamId: null,
+        projectCreatedAt: null,
+        projectUpdatedAt: null,
         userBrief: '',
         phase: 'idle',
+        currentRunId: null,
+        currentRunNumber: 0,
+        currentRunCreatedAt: null,
+        currentRunUpdatedAt: null,
+        currentRunCompletedAt: null,
+        runHistory: [],
+        runMarketSnapshots: [],
+        runAnalyses: [],
+        completionInProgress: false,
         finalOutput: null,
         finalOutputArtifacts: null,
         tasks: [],
@@ -231,6 +378,7 @@ export const useCoreStore = create<CoreState>()(
         agentHistories: {},
         agentSummaries: {},
         boardroomHistories: {},
+        agentExecutionStates: {},
         isFinalOutputOpen: false,
         totalTokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
         agentTokenUsage: {},
@@ -245,22 +393,176 @@ export const useCoreStore = create<CoreState>()(
         referenceImages: [],
       }),
 
-      setUserBrief: (brief) => set({ userBrief: brief }),
+      setUserBrief: (brief) => set({ userBrief: brief, projectUpdatedAt: Date.now() }),
       addReferenceImage: (base64) => set((s) => ({ 
-        referenceImages: [...s.referenceImages, base64].slice(0, 3) 
+        referenceImages: [...s.referenceImages, base64].slice(0, 3),
+        projectUpdatedAt: Date.now(),
       })),
       removeReferenceImage: (index) => set((s) => ({ 
-        referenceImages: s.referenceImages.filter((_, i) => i !== index) 
+        referenceImages: s.referenceImages.filter((_, i) => i !== index),
+        projectUpdatedAt: Date.now(),
       })),
-      clearReferenceImages: () => set({ referenceImages: [] }),
-      setPhase: (phase) => set({ phase }),
-      startProject: (brief) => set({ userBrief: brief, phase: 'working', finalAssetType: 'text', finalAssetContent: null, finalOutputArtifacts: null }),
-      setFinalOutput: (output, artifacts = null) => set({ finalOutput: output, finalOutputArtifacts: artifacts }),
+      clearReferenceImages: () => set({ referenceImages: [], projectUpdatedAt: Date.now() }),
+      setPhase: (phase) =>
+        set((s) => {
+          const now = Date.now();
+          const completedAt = phase === 'done' ? now : null;
+          const runHistory = s.currentRunId
+            ? s.runHistory.map((run) =>
+                run.runId === s.currentRunId
+                  ? {
+                      ...run,
+                      status: phase,
+                      updatedAt: now,
+                      completedAt,
+                    }
+                  : run
+              )
+            : s.runHistory;
+
+          return {
+            phase,
+            currentRunUpdatedAt: now,
+            currentRunCompletedAt: completedAt,
+            runHistory,
+            projectUpdatedAt: now,
+          };
+        }),
+      setCompletionInProgress: (completionInProgress) => set({ completionInProgress }),
+      setPendingProjectName: (name) => set({ pendingProjectName: name }),
+      startProject: (brief) => {
+        const now = Date.now();
+        const projectId = `project_${uid()}`;
+        const runId = `run_${uid()}`;
+        set((s) => ({
+          projectId,
+          projectName: s.pendingProjectName.trim() || brief.trim().split(/\r?\n/)[0]?.slice(0, 80) || 'Untitled Project',
+          pendingProjectName: '',
+          projectTeamId: useTeamStore.getState().selectedAgentSetId,
+          projectCreatedAt: now,
+          projectUpdatedAt: now,
+          userBrief: brief,
+          phase: 'working',
+          currentRunId: runId,
+          currentRunNumber: 1,
+          currentRunCreatedAt: now,
+          currentRunUpdatedAt: now,
+          currentRunCompletedAt: null,
+          runHistory: [{
+            runId,
+            runNumber: 1,
+            status: 'working',
+            createdAt: now,
+            updatedAt: now,
+            completedAt: null,
+            symbol: 'BEPL',
+          }],
+          runMarketSnapshots: [],
+          runAnalyses: [],
+          completionInProgress: false,
+          finalAssetType: 'text',
+          finalAssetContent: null,
+          finalOutput: null,
+          finalOutputArtifacts: null,
+        }));
+      },
+      startNewRun: () => {
+        set((s) => {
+          const now = Date.now();
+          const nextRunId = `run_${uid()}`;
+          const nextRunNumber = s.currentRunNumber + 1;
+
+          return {
+            userBrief: '',
+            phase: 'idle',
+            currentRunId: nextRunId,
+            currentRunNumber: nextRunNumber,
+            currentRunCreatedAt: now,
+            currentRunUpdatedAt: now,
+            currentRunCompletedAt: null,
+            runHistory: [
+              ...s.runHistory,
+              {
+                runId: nextRunId,
+                runNumber: nextRunNumber,
+                status: 'idle',
+                createdAt: now,
+                updatedAt: now,
+                completedAt: null,
+                symbol: s.selectedSymbol,
+              },
+            ],
+            runMarketSnapshots: [],
+            runAnalyses: [],
+            completionInProgress: false,
+            finalOutput: null,
+            finalOutputArtifacts: null,
+            finalAssetType: 'text',
+            finalAssetContent: null,
+            isGeneratingAsset: false,
+            isReviewingOutput: false,
+            pendingOutputPrompt: '',
+            pendingOutputParams: {},
+            tasks: [],
+            actionLog: [],
+            activityLog: [],
+            debugLog: [],
+            agentExecutionStates: {},
+            projectUpdatedAt: now,
+          };
+        });
+
+        // Run-scoped market analysis must not bleed into a new run.
+        useMarketStore.getState().clearAnalysis();
+      },
+      setFinalOutput: (output, artifacts = null) => set({ finalOutput: output, finalOutputArtifacts: artifacts, currentRunUpdatedAt: Date.now(), projectUpdatedAt: Date.now() }),
       setFinalAsset: (type, content) => set({ finalAssetType: type, finalAssetContent: content, isGeneratingAsset: false }),
       setIsGeneratingAsset: (isGenerating) => set({ isGeneratingAsset: isGenerating }),
       setReviewingOutput: (val) => set({ isReviewingOutput: val }),
       setPendingOutputPrompt: (prompt) => set({ pendingOutputPrompt: prompt }),
       setPendingOutputParams: (params) => set({ pendingOutputParams: params }),
+      recordRunMarketSnapshot: (entry) =>
+        set((s) => {
+          if (!s.currentRunId) return {};
+          const latest = s.runMarketSnapshots[s.runMarketSnapshots.length - 1];
+          const shouldSkip = latest
+            && latest.symbol === entry.symbol
+            && latest.retrievedAt === entry.retrievedAt
+            && latest.requestedBy === entry.requestedBy
+            && latest.error === entry.error;
+          if (shouldSkip) return {};
+
+          return {
+            runMarketSnapshots: [
+              ...s.runMarketSnapshots,
+              {
+                ...entry,
+                id: `snapshot_${uid()}`,
+                runId: s.currentRunId,
+                capturedAt: Date.now(),
+              },
+            ],
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
+          };
+        }),
+      recordRunAnalysis: (entry) =>
+        set((s) => {
+          if (!s.currentRunId) return {};
+          return {
+            runAnalyses: [
+              ...s.runAnalyses,
+              {
+                ...entry,
+                id: `analysis_${uid()}`,
+                runId: s.currentRunId,
+                timestamp: Date.now(),
+              },
+            ],
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
+          };
+        }),
 
       addTask: (task) => {
         const newTask: Task = {
@@ -270,7 +572,7 @@ export const useCoreStore = create<CoreState>()(
           createdAt: Date.now(),
           updatedAt: Date.now(),
         }
-        set((s) => ({ tasks: [...s.tasks, newTask] }))
+        set((s) => ({ tasks: [...s.tasks, newTask], currentRunUpdatedAt: Date.now(), projectUpdatedAt: Date.now() }))
         return newTask
       },
 
@@ -290,6 +592,8 @@ export const useCoreStore = create<CoreState>()(
           return {
             tasks: newTasks,
             phase: nextPhase,
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
           };
         }),
 
@@ -309,6 +613,8 @@ export const useCoreStore = create<CoreState>()(
 
           return {
             tasks: newTasks,
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
           };
         }),
 
@@ -323,6 +629,8 @@ export const useCoreStore = create<CoreState>()(
               updatedAt: Date.now() 
             } : t
           ),
+          currentRunUpdatedAt: Date.now(),
+          projectUpdatedAt: Date.now(),
         })),
 
       approveTask: (taskId) => {
@@ -345,6 +653,8 @@ export const useCoreStore = create<CoreState>()(
                 updatedAt: Date.now() 
               } : t
             ),
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
           };
         });
       },
@@ -382,7 +692,9 @@ export const useCoreStore = create<CoreState>()(
             agentHistories: {
               ...s.agentHistories,
               [task.assignedAgentId]: updatedHistory
-            }
+            },
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
           };
         });
       },
@@ -392,6 +704,8 @@ export const useCoreStore = create<CoreState>()(
           tasks: s.tasks.map((t) =>
             t.id === taskId ? { ...t, output, artifacts: artifacts ?? t.artifacts, updatedAt: Date.now() } : t
           ),
+          currentRunUpdatedAt: Date.now(),
+          projectUpdatedAt: Date.now(),
         })),
 
       addLogEntry: (entry) =>
@@ -400,6 +714,8 @@ export const useCoreStore = create<CoreState>()(
             ...s.actionLog,
             { ...entry, id: `log_${uid()}`, timestamp: Date.now() },
           ],
+          currentRunUpdatedAt: Date.now(),
+          projectUpdatedAt: Date.now(),
         })),
 
       addActivityEvent: (entry) =>
@@ -411,6 +727,8 @@ export const useCoreStore = create<CoreState>()(
 
           return {
             activityLog: next.length > 200 ? next.slice(-200) : next,
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
           };
         }),
       
@@ -424,7 +742,11 @@ export const useCoreStore = create<CoreState>()(
             status: 'completed'
           };
           const updated = [...s.debugLog, newEntry];
-          return { debugLog: updated.length > 30 ? updated.slice(-30) : updated };
+          return {
+            debugLog: updated.length > 30 ? updated.slice(-30) : updated,
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
+          };
         }),
 
       addResponseLog: (entry) =>
@@ -472,7 +794,9 @@ export const useCoreStore = create<CoreState>()(
             totalTokenUsage: nextTotalUsage,
             agentTokenUsage: nextAgentUsage,
             totalEstimatedCost: nextTotalCost,
-            agentEstimatedCost: nextAgentCost
+            agentEstimatedCost: nextAgentCost,
+            currentRunUpdatedAt: Date.now(),
+            projectUpdatedAt: Date.now(),
           };
         }),
 
@@ -488,6 +812,8 @@ export const useCoreStore = create<CoreState>()(
               },
             ],
           },
+          currentRunUpdatedAt: Date.now(),
+          projectUpdatedAt: Date.now(),
         })),
 
       setAgentSummary: (agentIndex, summary) =>
@@ -495,7 +821,9 @@ export const useCoreStore = create<CoreState>()(
           agentSummaries: {
             ...s.agentSummaries,
             [agentIndex]: summary
-          }
+          },
+          currentRunUpdatedAt: Date.now(),
+          projectUpdatedAt: Date.now(),
         })),
 
       appendBoardroomHistory: (taskId, role, parts) =>
@@ -510,9 +838,11 @@ export const useCoreStore = create<CoreState>()(
               },
             ],
           },
+          currentRunUpdatedAt: Date.now(),
+          projectUpdatedAt: Date.now(),
         })),
 
-      clearAllHistories: () => set({ agentHistories: {}, boardroomHistories: {} }),
+      clearAllHistories: () => set({ agentHistories: {}, boardroomHistories: {}, currentRunUpdatedAt: Date.now(), projectUpdatedAt: Date.now() }),
 
       setKanbanOpen: (open) => set({ isKanbanOpen: open }),
       setLogOpen: (open, filterAgent = null) =>
@@ -521,21 +851,70 @@ export const useCoreStore = create<CoreState>()(
       setIsResizing: (resizing) => set({ isResizing: resizing }),
 
       setAgentHistory: (agentIndex, history) => set((s) => ({
-        agentHistories: { ...s.agentHistories, [agentIndex]: history }
+        agentHistories: { ...s.agentHistories, [agentIndex]: history },
+        currentRunUpdatedAt: Date.now(),
+        projectUpdatedAt: Date.now(),
+      })),
+      setAgentExecutionState: (agentIndex, state) => set((s) => ({
+        agentExecutionStates: { ...s.agentExecutionStates, [agentIndex]: state },
+        currentRunUpdatedAt: Date.now(),
+        projectUpdatedAt: Date.now(),
       })),
     }),
     {
       name: 'core-storage',
       storage: createJSONStorage(() => localStorage),
-      partialize: (state) => ({}),
+      // This is the application's established project repository.  Persist every
+      // serializable project mutation, but deliberately exclude UI-only controls,
+      // runtime completion guards, and the BYOK Gemini API key (which is in uiStore).
+      partialize: (state) => ({
+        projectId: state.projectId,
+        projectName: state.projectName,
+        projectTeamId: state.projectTeamId,
+        projectCreatedAt: state.projectCreatedAt,
+        projectUpdatedAt: state.projectUpdatedAt,
+        userBrief: state.userBrief,
+        referenceImages: state.referenceImages,
+        phase: state.phase,
+        currentRunId: state.currentRunId,
+        currentRunNumber: state.currentRunNumber,
+        currentRunCreatedAt: state.currentRunCreatedAt,
+        currentRunUpdatedAt: state.currentRunUpdatedAt,
+        currentRunCompletedAt: state.currentRunCompletedAt,
+        runHistory: state.runHistory,
+        runMarketSnapshots: state.runMarketSnapshots,
+        runAnalyses: state.runAnalyses,
+        finalOutput: state.finalOutput,
+        finalOutputArtifacts: state.finalOutputArtifacts,
+        totalTokenUsage: state.totalTokenUsage,
+        agentTokenUsage: state.agentTokenUsage,
+        totalEstimatedCost: state.totalEstimatedCost,
+        agentEstimatedCost: state.agentEstimatedCost,
+        finalAssetType: state.finalAssetType,
+        finalAssetContent: state.finalAssetContent,
+        isGeneratingAsset: state.isGeneratingAsset,
+        isReviewingOutput: state.isReviewingOutput,
+        pendingOutputPrompt: state.pendingOutputPrompt,
+        pendingOutputParams: state.pendingOutputParams,
+        tasks: state.tasks,
+        actionLog: state.actionLog,
+        activityLog: state.activityLog,
+        debugLog: state.debugLog,
+        agentHistories: state.agentHistories,
+        agentSummaries: state.agentSummaries,
+        boardroomHistories: state.boardroomHistories,
+        agentExecutionStates: state.agentExecutionStates,
+        selectedSymbol: state.selectedSymbol,
+        portfolio: state.portfolio,
+      }),
     }
   )
 )
 
 // Sync resetProject whenever the active team changes
 useTeamStore.subscribe((state, prevState) => {
-  if (state.selectedAgentSetId !== prevState.selectedAgentSetId) {
+  const project = useCoreStore.getState();
+  if (state.selectedAgentSetId !== prevState.selectedAgentSetId && project.projectTeamId !== state.selectedAgentSetId) {
     useCoreStore.getState().resetProject();
   }
 });
-

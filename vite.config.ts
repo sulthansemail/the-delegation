@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 import { defineConfig, loadEnv, type Plugin } from 'vite';
 import { spawn } from 'child_process';
+import { readFileSync, existsSync } from 'fs';
 
 function localMarketDataApi(): Plugin {
   return {
@@ -245,6 +246,344 @@ function runPythonMarketData(
   });
 }
 
+function decisionEngineAnalysisApi(): Plugin {
+  return {
+    name: 'decision-engine-analysis-api',
+
+    configureServer(server) {
+      server.middlewares.use(
+        '/api/analyze',
+        async (req, res) => {
+          if (req.method !== 'POST') {
+            res.statusCode = 405;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(
+              JSON.stringify({
+                success: false,
+                error: 'Method not allowed.',
+              })
+            );
+            return;
+          }
+
+          try {
+            let body = '';
+
+            for await (const chunk of req) {
+              body += chunk;
+            }
+
+            const parsed = JSON.parse(body);
+
+            const symbol = String(
+              parsed?.symbol ?? ''
+            )
+              .trim()
+              .toUpperCase();
+
+            const quantity = Number(
+              parsed?.quantity ?? 0
+            );
+
+            const averagePrice = Number(
+              parsed?.averagePrice ?? 0
+            );
+
+            if (!/^[A-Z0-9._-]+$/.test(symbol)) {
+              throw new Error(
+                'Invalid stock symbol.'
+              );
+            }
+
+            const projectRoot = process.cwd();
+
+            const result =
+              await runAnalysis(
+                projectRoot,
+                symbol,
+                quantity,
+                averagePrice
+              );
+
+            res.statusCode = result.success
+              ? 200
+              : 400;
+
+            res.setHeader(
+              'Content-Type',
+              'application/json'
+            );
+
+            res.end(
+              JSON.stringify(result)
+            );
+          } catch (error) {
+            res.statusCode = 400;
+            res.setHeader(
+              'Content-Type',
+              'application/json'
+            );
+
+            res.end(
+              JSON.stringify({
+                success: false,
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : 'Analysis failed.',
+              })
+            );
+          }
+        }
+      );
+    },
+  };
+}
+
+function isMarketDataFresh(
+  csvPath: string,
+  maxAgeMs = 1000 * 60 * 60 * 24
+): boolean {
+  try {
+    const csv = readFileSync(csvPath, 'utf-8');
+    const lines = csv
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (lines.length < 2) {
+      return false;
+    }
+
+    const lastLine = lines[lines.length - 1];
+    const firstField = lastLine.split(',')[0]?.trim();
+
+    if (!firstField) {
+      return false;
+    }
+
+    const latestDate = new Date(firstField);
+
+    if (Number.isNaN(latestDate.getTime())) {
+      return false;
+    }
+
+    return Date.now() - latestDate.getTime() <= maxAgeMs;
+  } catch {
+    return false;
+  }
+}
+
+function runAnalysis(
+  projectRoot: string,
+  symbol: string,
+  quantity: number,
+  averagePrice: number
+): Promise<{
+  success: boolean;
+  symbol: string;
+  latestDate?: string;
+  currentPrice?: number;
+  decision?: any;
+  error?: string;
+}> {
+  return new Promise(async (resolve) => {
+    try {
+      const csvPath = path.join(
+        projectRoot,
+        'data',
+        'market_data',
+        `${symbol}_OHLCV.csv`
+      );
+
+      let csvExists = existsSync(csvPath);
+      const needsRefresh =
+        csvExists && !isMarketDataFresh(csvPath);
+
+      if (!csvExists || needsRefresh) {
+        const dataResult = await acquireMarketData(
+          projectRoot,
+          symbol
+        );
+
+        if (!dataResult.success) {
+          resolve({
+            success: false,
+            symbol,
+            error: `Unable to obtain market data for ${symbol}.`,
+          });
+          return;
+        }
+
+        csvExists = existsSync(csvPath);
+
+        if (!csvExists || !isMarketDataFresh(csvPath)) {
+          resolve({
+            success: false,
+            symbol,
+            error: `Unable to obtain market data for ${symbol}.`,
+          });
+          return;
+        }
+      }
+
+      // Proceed with analysis
+      const scriptPath = path.join(
+        projectRoot,
+        'scripts',
+        'test_decision_engine.ts'
+      );
+
+      const child = spawn(
+        'node',
+        [
+          '--experimental-strip-types',
+          scriptPath,
+          symbol,
+          String(quantity),
+          String(averagePrice),
+        ],
+        {
+          cwd: projectRoot,
+          env: process.env,
+        }
+      );
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('error', (error) => {
+        resolve({
+          success: false,
+          symbol,
+          error: 'Analysis failed.',
+        });
+      });
+
+      child.on('close', (code) => {
+        if (code !== 0) {
+          resolve({
+            success: false,
+            symbol,
+            error: 'Unable to analyze this symbol.',
+          });
+
+          return;
+        }
+
+        try {
+          const result = JSON.parse(stdout);
+
+          if (result.decision) {
+            resolve({
+              success: true,
+              symbol: result.symbol,
+              latestDate: result.market?.timestamp,
+              currentPrice: result.market?.currentPrice,
+              decision: result.decision,
+            });
+          } else {
+            resolve({
+              success: false,
+              symbol,
+              error: 'Unable to analyze this symbol.',
+            });
+          }
+        } catch {
+          resolve({
+            success: false,
+            symbol,
+            error: 'Unable to analyze this symbol.',
+          });
+        }
+      });
+    } catch (error) {
+      resolve({
+        success: false,
+        symbol,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unable to analyze this symbol.',
+      });
+    }
+  });
+}
+
+function acquireMarketData(
+  projectRoot: string,
+  symbol: string
+): Promise<{
+  success: boolean;
+  symbol: string;
+}> {
+  return new Promise((resolve) => {
+    const pythonPath = path.join(
+      projectRoot,
+      '.venv',
+      'bin',
+      'python'
+    );
+
+    const scriptPath = path.join(
+      projectRoot,
+      'scripts',
+      'market_data.py'
+    );
+
+    const child = spawn(
+      pythonPath,
+      [scriptPath, symbol, '5y', '1d'],
+      {
+        cwd: projectRoot,
+        env: process.env,
+      }
+    );
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    child.on('error', (error) => {
+      resolve({
+        success: false,
+        symbol,
+      });
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        resolve({
+          success: false,
+          symbol,
+        });
+
+        return;
+      }
+
+      resolve({
+        success: true,
+        symbol,
+      });
+    });
+  });
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '');
 
@@ -255,6 +594,7 @@ export default defineConfig(({ mode }) => {
       react(),
       tailwindcss(),
       localMarketDataApi(),
+      decisionEngineAnalysisApi(),
     ],
 
     define: {

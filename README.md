@@ -33,6 +33,15 @@ npm install
 ```bash
 export KRONOS_API_URL=http://127.0.0.1:7070
 # Optional: export KRONOS_INTERNAL_API_KEY=your_internal_key_here
+
+# Firebase Auth + Firestore (required for durable project persistence)
+export VITE_FIREBASE_API_KEY=your_api_key
+export VITE_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
+export VITE_FIREBASE_PROJECT_ID=your_project_id
+export VITE_FIREBASE_APP_ID=your_app_id
+# Optional
+export VITE_FIREBASE_STORAGE_BUCKET=your_project.firebasestorage.app
+export VITE_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
 ```
 
 3. **Run the development server:**
@@ -42,6 +51,21 @@ npm run dev
 ```
 
 4. **Open the app:** Navigate to the local URL shown in your terminal (usually `http://localhost:3000/the-delegation`).
+
+## Firestore Persistence
+
+- Firestore is used as the authoritative persistent data store for project and run state.
+- Zustand remains the in-memory runtime/UI state layer.
+- Authentication uses Firebase Auth (anonymous sign-in by default).
+- Data is stored per user under users/{uid}/projects/{projectId} with nested runs/{runId}.
+- Existing local Zustand state is migrated to Firestore on first successful authenticated sync.
+- Local storage is retained after migration as a safety fallback and is not deleted automatically.
+- Gemini API keys are never written to Firestore.
+
+### Security Rules
+
+- Firestore rules are provided in firestore.rules.
+- Only the authenticated owner UID can read and write their project and run documents.
 
 ## Features
 

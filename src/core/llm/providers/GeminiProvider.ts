@@ -1,4 +1,4 @@
-import { FunctionDeclaration, GoogleGenAI, Tool, Type } from '@google/genai';
+import { FunctionCallingConfigMode, FunctionDeclaration, GoogleGenAI, Tool, Type } from '@google/genai';
 import { LLMGroundingCitation, LLMMessage, LLMProvider, LLMResponse, LLMToolCall, LLMToolDefinition } from '../types';
 import { DEFAULT_MODELS } from '../constants';
 import { calculateTokensForCost } from '../pricing';
@@ -27,13 +27,19 @@ type GeminiErrorKind = 'authentication' | 'quota' | 'rate-limit' | 'service-unav
 interface GeminiErrorInfo {
   kind: GeminiErrorKind;
   reason: string;
+  message: string;
   retryAfterMs?: number;
 }
 
 const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
-const MAX_GEMINI_ATTEMPTS = 2;
-const MAX_BACKOFF_MS = 2000;
+const MAX_RATE_LIMIT_RETRIES = 2;
+const BASE_RATE_LIMIT_BACKOFF_MS = 5000;
+const MAX_BACKOFF_MS = 30000;
+const MIN_REQUEST_INTERVAL_MS = 2500;
 const modelCache = new Map<string, CachedModelList>();
+const rateLimitCooldownByKey = new Map<string, number>();
+const inFlightByKey = new Map<string, boolean>();
+const lastRequestAtByKey = new Map<string, number>();
 
 export class GeminiProvider implements LLMProvider {
   private client: GoogleGenAI;
@@ -73,41 +79,98 @@ export class GeminiProvider implements LLMProvider {
   ): Promise<LLMResponse> {
     const contents = this.mapMessagesToGemini(messages);
     const capabilities = this.getRequestCapabilities(messages, tools, systemInstruction);
+    const cacheKey = this.getApiKeyFingerprint();
+    const selectedModel = modelName.replace(/^models\//, '');
 
-    const candidates = (await this.getModelCandidates(modelName, capabilities)).slice(0, MAX_GEMINI_ATTEMPTS);
-    let lastError: unknown;
-    for (const [attemptIndex, candidate] of candidates.entries()) {
-      try {
-        const response = await this.generateCompletionWithModel(contents, tools, systemInstruction, candidate, capabilities);
-        if (candidate !== candidates[0]) {
-          console.info(`[GeminiProvider] Fallback succeeded with ${candidate}.`);
-        } else {
-          console.info(`[GeminiProvider] Selected ${candidate}.`);
-        }
-        return response;
-      } catch (error) {
-        const errorInfo = this.getErrorInfo(error);
-        lastError = error;
-        if (errorInfo.kind === 'authentication' || errorInfo.kind === 'other') throw error;
+    await this.waitForRequestSlot(cacheKey);
 
-        if (errorInfo.kind === 'quota') {
-          console.warn(`[GeminiProvider] MODEL_RATE_LIMITED model=${candidate}`);
-          console.warn('[GeminiProvider] FALLBACK_STOPPED reason=project_quota_or_rate_limit');
-          throw new Error('Gemini project or daily quota is exhausted. Try again later or check your Gemini quota.');
-        }
+    try {
+      await this.waitForGlobalCooldown(cacheKey);
+      await this.waitForMinimumRequestInterval(cacheKey);
 
-        if (attemptIndex >= candidates.length - 1) break;
-        if (errorInfo.kind === 'rate-limit') {
-          console.warn(`[GeminiProvider] MODEL_RATE_LIMITED model=${candidate}`);
-        }
-        if (errorInfo.kind === 'rate-limit' || errorInfo.kind === 'service-unavailable') {
-          await this.waitForBackoff(attemptIndex, errorInfo.retryAfterMs);
-        }
-        console.warn(`[GeminiProvider] Falling back from ${candidate}: ${errorInfo.reason}.`);
+      if (!this.isCompatibleWithRequest(selectedModel, capabilities)) {
+        throw new Error(`The selected Gemini model (${selectedModel}) does not support the requested tool combination. No automatic model switch was performed.`);
       }
-    }
 
-    throw new Error(this.getSafeErrorReason(lastError) || 'Gemini is unavailable.');
+      console.info(`[GeminiProvider] Selected model=${selectedModel}`);
+      let lastError: unknown;
+
+      for (let retryCount = 0; retryCount <= MAX_RATE_LIMIT_RETRIES; retryCount += 1) {
+        try {
+          this.markRequestSent(cacheKey);
+          return this.usesInteractionsApi(selectedModel)
+            ? await this.generateCompletionWithInteraction(messages, systemInstruction, selectedModel)
+            : await this.generateCompletionWithModel(contents, tools, systemInstruction, selectedModel, capabilities);
+        } catch (error) {
+          const errorInfo = this.getErrorInfo(error);
+          lastError = error;
+
+          if (errorInfo.kind !== 'rate-limit') {
+            console.error(`[GeminiProvider] REQUEST_FAILED model=${selectedModel} reason=${errorInfo.reason}`, errorInfo.message, error);
+          }
+
+          if (errorInfo.kind === 'rate-limit') {
+            if (retryCount < MAX_RATE_LIMIT_RETRIES) {
+              const delayMs = this.getExponentialBackoffDelayMs(retryCount, errorInfo.retryAfterMs);
+              this.extendGlobalCooldown(cacheKey, delayMs);
+              console.warn(`[GeminiProvider] RATE_LIMITED model=${selectedModel} retry=${retryCount + 1}/${MAX_RATE_LIMIT_RETRIES} delayMs=${delayMs}`);
+              await this.waitForBackoff(delayMs);
+              continue;
+            }
+
+            const cooldownMs = this.getExponentialBackoffDelayMs(MAX_RATE_LIMIT_RETRIES, errorInfo.retryAfterMs);
+            this.extendGlobalCooldown(cacheKey, cooldownMs);
+            console.warn(`[GeminiProvider] RATE_LIMIT_RETRIES_EXHAUSTED model=${selectedModel}`);
+            return {
+              content: `The selected Gemini model (${selectedModel}) is temporarily rate-limited. No automatic model switch was performed. Please retry or select another model manually.`,
+              finishReason: 'RATE_LIMIT',
+              grounding: {
+                enabled: false,
+                citations: [],
+                searchQueries: []
+              },
+              raw: {
+                providerError: this.getSafeErrorReason(lastError),
+                selectedModel
+              },
+              request: {
+                contents,
+                systemInstruction,
+                tools,
+                grounding: {
+                  enabled: false,
+                  status: 'disabled',
+                  reason: 'Rate limit retries exhausted on selected model without fallback.'
+                }
+              }
+            };
+          }
+
+          if (errorInfo.kind === 'quota') {
+            console.warn(`[GeminiProvider] QUOTA_EXHAUSTED model=${selectedModel}`);
+            throw new Error(`The selected Gemini model (${selectedModel}) cannot be used because project or daily quota is exhausted. No automatic model switch was performed.`);
+          }
+
+          if (errorInfo.kind === 'authentication') {
+            throw new Error(`Gemini authentication or permission failure for selected model (${selectedModel}). No automatic model switch was performed.`);
+          }
+
+          if (errorInfo.kind === 'service-unavailable') {
+            throw new Error(`The selected Gemini model (${selectedModel}) is temporarily unavailable. No automatic model switch was performed.`);
+          }
+
+          if (errorInfo.kind === 'model') {
+            throw new Error(`The selected Gemini model (${selectedModel}) is unavailable for this API key or method. No automatic model switch was performed.`);
+          }
+
+          throw new Error(`Gemini request failed for selected model (${selectedModel}): ${errorInfo.message}. No automatic model switch was performed.`);
+        }
+      }
+
+      throw new Error(this.getSafeErrorReason(lastError) || `Gemini request failed for selected model (${selectedModel}).`);
+    } finally {
+      this.releaseRequestSlot(cacheKey);
+    }
   }
 
   private async generateCompletionWithModel(
@@ -139,15 +202,21 @@ export class GeminiProvider implements LLMProvider {
       systemTools.push({ googleSearch: {} });
     }
 
+    const hasCustomFunctions = functionDeclarations !== undefined && functionDeclarations.length > 0;
+    const hasBuiltInTools = grounding.enabled;
+    const config = this.createTextGenerationConfig(modelName, systemInstruction, systemTools, hasCustomFunctions, hasBuiltInTools);
+
+    if (import.meta.env.DEV) {
+      console.info(`[GeminiProvider] model=${modelName}`);
+      console.info(`[GeminiProvider] builtInTools=${hasBuiltInTools}`);
+      console.info(`[GeminiProvider] customFunctions=${hasCustomFunctions}`);
+      console.info(`[GeminiProvider] includeServerSideToolInvocations=${Boolean(config.toolConfig?.includeServerSideToolInvocations)}`);
+    }
+
     const result = await this.client.models.generateContent({
       model: modelName,
       contents,
-      config: {
-        systemInstruction: systemInstruction,
-        temperature: 0.2,
-        maxOutputTokens: 4096,
-        tools: systemTools.length > 0 ? systemTools : undefined,
-      }
+      config
     });
     const candidate = result.candidates?.[0];
     const groundingMetadata = candidate?.groundingMetadata;
@@ -227,24 +296,41 @@ export class GeminiProvider implements LLMProvider {
     };
   }
 
-  private async getModelCandidates(configuredModel: string, capabilities: GeminiRequestCapabilities): Promise<string[]> {
-    let discovered: string[];
-    try {
-      discovered = await this.getAvailableModels();
-    } catch (error) {
-      console.warn(`[GeminiProvider] Model discovery unavailable: ${this.getSafeErrorReason(error)}.`);
-      const configured = configuredModel.replace(/^models\//, '');
-      if (!this.isCompatibleWithRequest(configured, capabilities)) {
-        throw new Error('No available Gemini model supports the requested tool combination.');
-      }
-      return configured ? [configured] : [DEFAULT_MODELS.text];
-    }
+  private async generateCompletionWithInteraction(
+    messages: LLMMessage[],
+    systemInstruction: string | undefined,
+    modelName: string,
+  ): Promise<LLMResponse> {
+    const input = messages
+      .map(message => `${message.role === 'assistant' ? 'Assistant' : 'User'}: ${message.content}`)
+      .join('\n\n');
+    const interaction = await this.client.interactions.create({
+      model: modelName,
+      input: [{ type: 'text', text: input }],
+      stream: false,
+      system_instruction: systemInstruction,
+      generation_config: {
+        max_output_tokens: 4096,
+      },
+    });
+    const content = interaction.output_text || null;
 
-    const compatible = discovered.filter(model => this.isCompatibleWithRequest(model, capabilities));
-    if (compatible.length === 0) {
-      throw new Error('No available Gemini model supports the requested tool combination.');
-    }
-    return compatible.sort((left, right) => this.modelRankForRequest(left, right, capabilities));
+    return {
+      content,
+      usage: interaction.usage ? {
+        promptTokens: interaction.usage.total_input_tokens || 0,
+        completionTokens: interaction.usage.total_output_tokens || 0,
+        totalTokens: interaction.usage.total_tokens || 0,
+      } : undefined,
+      finishReason: interaction.status,
+      grounding: { enabled: false, citations: [], searchQueries: [] },
+      raw: interaction,
+      request: {
+        contents: [{ role: 'user', parts: [{ text: input }] }],
+        systemInstruction,
+        grounding: { enabled: false, status: 'disabled', reason: 'Gemini Interactions API request.' },
+      },
+    };
   }
 
   private getRequestCapabilities(
@@ -274,7 +360,7 @@ export class GeminiProvider implements LLMProvider {
   }
 
   private isSimpleDeterministicRequest(text: string): boolean {
-    return /^\s*(?:what is\s+)?\d+(?:\s*[+\-*/]\s*\d+)+\s*[?!.]?\s*$/.test(text);
+    return /^\s*(?:what is\s+)?\d+(?:\s*[+\-*\/]\s*\d+)+\s*[?!.]?\s*$/.test(text);
   }
 
   private isCompatibleWithRequest(modelName: string, capabilities: GeminiRequestCapabilities): boolean {
@@ -324,7 +410,7 @@ export class GeminiProvider implements LLMProvider {
 
   private rankTextModels(models: GeminiModelCandidate[]): string[] {
     return models
-      .filter(model => model.supportedActions?.includes('generateContent'))
+      .filter(model => model.supportedActions?.includes('generateContent') || this.usesInteractionsApi(model.name))
       .filter(model => {
         const name = `${model.name} ${model.displayName || ''}`.toLowerCase();
         return model.name.toLowerCase().startsWith('gemini-')
@@ -339,28 +425,49 @@ export class GeminiProvider implements LLMProvider {
 
   private modelRank(modelName: string): number {
     const model = modelName.toLowerCase();
-    if (model.includes('flash-lite')) return 0;
-    if (model.includes('2.5-flash')) return 5;
-    if (model.includes('flash')) return 10;
-    if (model.includes('pro')) return 30;
-    return 20;
+    if (model.includes('pro')) return 10;
+    if (model.includes('flash')) return 20;
+    return 30;
   }
 
-  private modelRankForRequest(left: string, right: string, capabilities: GeminiRequestCapabilities): number {
-    if (!capabilities.searchAndCustomFunctions) return this.modelRank(left) - this.modelRank(right);
+  private usesInteractionsApi(modelName: string): boolean {
+    return modelName.toLowerCase().includes('gemini-3.1-');
+  }
 
-    const preferredOrder = [
-      'gemini-3.6-flash',
-      'gemini-3.5-flash',
-      'gemini-3.5-flash-lite',
-      'gemini-3-flash-preview',
-      'gemini-3.1-pro-preview',
-    ];
-    const rank = (modelName: string) => {
-      const index = preferredOrder.indexOf(modelName.toLowerCase());
-      return index >= 0 ? index : preferredOrder.length + this.modelRank(modelName);
+  private createTextGenerationConfig(
+    modelName: string,
+    systemInstruction: string | undefined,
+    tools: Tool[],
+    hasCustomFunctions: boolean,
+    hasBuiltInTools: boolean,
+  ): {
+    systemInstruction: string | undefined;
+    maxOutputTokens: number;
+    tools: Tool[] | undefined;
+    toolConfig?: {
+      functionCallingConfig: {
+        mode: FunctionCallingConfigMode;
+      };
+      includeServerSideToolInvocations?: boolean;
     };
-    return rank(left) - rank(right);
+    temperature?: number;
+  } {
+    const config = {
+      systemInstruction,
+      maxOutputTokens: 4096,
+      tools: tools.length > 0 ? tools : undefined,
+      toolConfig: hasCustomFunctions
+        ? {
+            functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO },
+            includeServerSideToolInvocations: hasBuiltInTools || undefined,
+          }
+        : undefined,
+    };
+
+    // Gemini 3.x rejects legacy sampling fields such as temperature, topP, and topK.
+    return modelName.toLowerCase().startsWith('gemini-3')
+      ? config
+      : { ...config, temperature: 0.2 };
   }
 
   private getApiKeyFingerprint(): string {
@@ -386,33 +493,78 @@ export class GeminiProvider implements LLMProvider {
     const message = `${String(candidate?.message ?? candidate?.error?.message ?? error ?? '')} ${details}`.toLowerCase();
     const retryAfterMs = this.getRetryAfterMs(candidate?.response?.headers);
 
+    const apiMessage = String(candidate?.error?.message ?? candidate?.message ?? error ?? 'Gemini request failed');
+
     if (status === '401' || status === '403' || status.includes('unauthenticated') || status.includes('permission_denied')
       || message.includes('invalid api key') || message.includes('authentication') || message.includes('permission denied')) {
-      return { kind: 'authentication', reason: 'Gemini authentication or permission failure' };
+      return { kind: 'authentication', reason: 'Gemini authentication or permission failure', message: apiMessage };
     }
     if (message.includes('daily quota') || message.includes('per day') || message.includes('quota exceeded')
       || message.includes('project quota') || message.includes('quota_exceeded')) {
-      return { kind: 'quota', reason: 'project or daily quota exhausted' };
+      return { kind: 'quota', reason: 'project or daily quota exhausted', message: apiMessage };
     }
-    if (status === '429' || message.includes('rate_limit_exceeded') || message.includes('rate limit')) {
-      return { kind: 'rate-limit', reason: 'rate limit exceeded', retryAfterMs };
+    if (status === '429' || message.includes('rate_limit_exceeded') || message.includes('rate limit') || message.includes('too many requests')) {
+      return { kind: 'rate-limit', reason: 'rate limit exceeded', message: apiMessage, retryAfterMs };
     }
     if (message.includes('resource_exhausted')) {
-      return { kind: 'quota', reason: 'project or daily quota exhausted' };
+      return { kind: 'quota', reason: 'project or daily quota exhausted', message: apiMessage };
     }
     if (status === '503' || status === '500' || status === '502' || status === '504' || message.includes('temporarily unavailable')) {
-      return { kind: 'service-unavailable', reason: 'temporary Gemini service failure', retryAfterMs };
+      return { kind: 'service-unavailable', reason: 'temporary Gemini service failure', message: apiMessage, retryAfterMs };
     }
     if (message.includes('model not found') || message.includes('model_not_found') || message.includes('invalid model')
       || message.includes('unsupported model') || message.includes('unavailable model')) {
-      return { kind: 'model', reason: 'model unavailable' };
+      return { kind: 'model', reason: 'model unavailable', message: apiMessage };
     }
-    return { kind: 'other', reason: 'Gemini request failed' };
+    return { kind: 'other', reason: 'Gemini request failed', message: apiMessage };
   }
 
-  private async waitForBackoff(attemptIndex: number, retryAfterMs?: number): Promise<void> {
-    const delayMs = Math.min(retryAfterMs ?? 250 * (2 ** attemptIndex), MAX_BACKOFF_MS);
+  private getExponentialBackoffDelayMs(retryIndex: number, retryAfterMs?: number): number {
+    const exponentialDelayMs = Math.min(BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryIndex), MAX_BACKOFF_MS);
+    const jitterFactor = 0.85 + Math.random() * 0.3;
+    const jitteredDelayMs = Math.round(exponentialDelayMs * jitterFactor);
+    const effectiveDelayMs = Math.max(250, jitteredDelayMs);
+    return retryAfterMs ? Math.max(effectiveDelayMs, retryAfterMs) : effectiveDelayMs;
+  }
+
+  private async waitForBackoff(delayMs: number): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+
+  private async waitForGlobalCooldown(cacheKey: string): Promise<void> {
+    const cooldownUntil = rateLimitCooldownByKey.get(cacheKey) ?? 0;
+    const now = Date.now();
+    if (cooldownUntil <= now) return;
+    await this.waitForBackoff(cooldownUntil - now);
+  }
+
+  private async waitForMinimumRequestInterval(cacheKey: string): Promise<void> {
+    const lastRequestAt = lastRequestAtByKey.get(cacheKey) ?? 0;
+    const elapsedMs = Date.now() - lastRequestAt;
+    if (elapsedMs >= MIN_REQUEST_INTERVAL_MS) return;
+    await this.waitForBackoff(MIN_REQUEST_INTERVAL_MS - elapsedMs);
+  }
+
+  private markRequestSent(cacheKey: string): void {
+    lastRequestAtByKey.set(cacheKey, Date.now());
+  }
+
+  private async waitForRequestSlot(cacheKey: string): Promise<void> {
+    while (inFlightByKey.get(cacheKey)) {
+      await this.waitForBackoff(150);
+    }
+    inFlightByKey.set(cacheKey, true);
+  }
+
+  private releaseRequestSlot(cacheKey: string): void {
+    inFlightByKey.delete(cacheKey);
+  }
+
+  private extendGlobalCooldown(cacheKey: string, delayMs: number): void {
+    const now = Date.now();
+    const currentUntil = rateLimitCooldownByKey.get(cacheKey) ?? now;
+    const nextUntil = Math.max(currentUntil, now + delayMs);
+    rateLimitCooldownByKey.set(cacheKey, nextUntil);
   }
 
   private getRetryAfterMs(headers?: Headers): number | undefined {
@@ -432,7 +584,7 @@ export class GeminiProvider implements LLMProvider {
     if (errorInfo.kind === 'service-unavailable') return 'temporary Gemini service failure';
     if (errorInfo.kind === 'authentication') return 'Gemini authentication or permission failure';
     if (errorInfo.kind === 'model') return 'Gemini model unavailable';
-    return 'Gemini request failed';
+    return errorInfo.message;
   }
 
   private shouldEnableGoogleSearchForText(modelName: string): boolean {
@@ -748,7 +900,7 @@ export class GeminiProvider implements LLMProvider {
             parts.push({
               functionCall: {
                 name: tc.function.name,
-                args: JSON.parse(tc.function.arguments)
+                args: this.parseJsonOrValue(tc.function.arguments)
               }
             });
           }
@@ -758,7 +910,7 @@ export class GeminiProvider implements LLMProvider {
           parts.push({
             functionResponse: {
               name: m.name,
-              response: JSON.parse(m.content)
+              response: this.parseToolResponseContent(m.content)
             }
           });
         }
@@ -788,6 +940,30 @@ export class GeminiProvider implements LLMProvider {
 
         return { role, parts };
       });
+  }
+
+  private parseJsonOrValue(value: unknown): unknown {
+    if (typeof value !== 'string') return value;
+
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return { raw: value };
+    }
+  }
+
+  private parseToolResponseContent(content: string): unknown {
+    const trimmed = content.trim();
+    if (!trimmed) return { content: '' };
+
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return { content };
+    }
   }
 
   private mapToGeminiSchema(schema: any): any {

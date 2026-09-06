@@ -167,7 +167,7 @@ const PricingModal: React.FC<PricingModalProps> = ({ onClose }) => {
                     <div className="space-y-3">
                       {typeModels.map(([model, pricing]) => {
                         const isDefault = model === (DEFAULT_MODELS as any)[type];
-                        const label = pricing.perSong !== undefined ? (model === 'lyria-3-clip-preview' ? '30 Sec Song' : 'Song') : 'Sec';
+                        const label = pricing.perSong !== undefined ? (model === DEFAULT_MODELS.music ? '30 Sec Song' : 'Song') : 'Sec';
 
                         return (
                           <div key={model} className={`relative px-5 py-3.5 rounded-2xl border transition-all duration-300 flex items-center justify-between ${

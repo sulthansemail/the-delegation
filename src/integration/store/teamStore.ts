@@ -2,6 +2,58 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { AgenticSystem, DEFAULT_AGENTIC_SET_ID, getAgentSet } from '../../data/agents';
+import { DEFAULT_MODELS } from '../../core/llm/constants';
+
+// NUCLEAR SANITIZATION: Run synchronously at module load time before store initialization
+(() => {
+  try {
+    const teamData = localStorage.getItem('team-storage');
+    if (teamData) {
+      // Check for any old model references and nuke the entire localStorage entry
+      if (
+        teamData.includes('2.5-flash-lite') ||
+        teamData.includes('veo-3') ||
+        teamData.includes('gemini-1.5')
+      ) {
+        localStorage.removeItem('team-storage');
+      }
+    }
+  } catch { }
+})();
+
+const normalizeSupportedModels = (model: any): string => {
+  const previousFlashDefault = DEFAULT_MODELS.text.replace('-preview', '');
+  if (model === previousFlashDefault) return DEFAULT_MODELS.text;
+  if (typeof model === 'string' && model.trim().length > 0) {
+    return model;
+  }
+
+  return DEFAULT_MODELS.text;
+};
+
+const normalizeAgentSystem = (system: any): AgenticSystem => {
+  if (!system) return system;
+
+  return {
+    ...system,
+    outputModel: normalizeSupportedModels(system.outputModel),
+    user: system.user
+      ? { ...system.user, model: system.user.model }
+      : system.user,
+    agents: Array.isArray(system.agents)
+      ? system.agents.map((agent: any) => ({
+          ...agent,
+          model: normalizeSupportedModels(agent.model),
+          subagents: Array.isArray(agent.subagents)
+            ? agent.subagents.map((sub: any) => ({
+                ...sub,
+                model: normalizeSupportedModels(sub.model),
+              }))
+            : agent.subagents,
+        }))
+      : system.agents,
+  };
+};
 
 export type AgentSet = AgenticSystem;
 
@@ -62,6 +114,11 @@ export const useTeamStore = create<TeamState>()(
     {
       name: 'team-storage',
       storage: createJSONStorage(() => localStorage),
+      onRehydrateStorage: () => (state) => {
+        if (state?.customSystems) {
+          state.customSystems = state.customSystems.map(normalizeAgentSystem);
+        }
+      },
     }
   )
 );

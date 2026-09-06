@@ -15,12 +15,13 @@ export function useChatAvailability(agentIndex: number | null): ChatAvailability
   const { phase, tasks, isGeneratingAsset } = useCoreStore()
   const agentStatus = useUiStore((s) => (agentIndex !== null ? s.agentStatuses[agentIndex] : 'idle'))
   const system = useActiveTeam()
+  const isLead = agentIndex === system.leadAgent.index
 
   if (agentIndex === null) return { canChat: false, reason: '' }
   if (isGeneratingAsset) return { canChat: false, reason: 'Delivering...' }
-  if (phase === 'done') return { canChat: false, reason: 'Project completed' }
-
-  const isLead = agentIndex === system.leadAgent.index
+  if (phase === 'done') {
+    return isLead ? { canChat: true, reason: '' } : { canChat: false, reason: 'Ask the lead for follow-ups' }
+  }
 
   // 1. Idle Phase: Only Lead Agent can chat (to set the brief)
   if (phase === 'idle') {
